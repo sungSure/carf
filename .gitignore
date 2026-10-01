@@ -1,0 +1,6 @@
+MDK-ARM/
+Drivers/
+.workbuddy/
+.vs/
+./vscode/
+*.bak
