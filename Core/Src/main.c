@@ -113,8 +113,8 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-/* 压黑线时红外DO输出低电平 → 1=在黑线上 */
-#define IR_ON_LINE        GPIO_PIN_RESET
+/* 压黑线时红外DO输出高电平(实测, 调试屏实心=压线) → 1=在黑线上 */
+#define IR_ON_LINE        GPIO_PIN_SET
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
