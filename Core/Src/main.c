@@ -266,8 +266,8 @@ static void Motor_Set(int16_t l, int16_t r)
     else if (r < 0) { HAL_GPIO_WritePin(GPIOB, IN3_Pin, GPIO_PIN_RESET); HAL_GPIO_WritePin(GPIOB, IN4_Pin, GPIO_PIN_SET); }
     else            { HAL_GPIO_WritePin(GPIOB, IN3_Pin, GPIO_PIN_RESET); HAL_GPIO_WritePin(GPIOB, IN4_Pin, GPIO_PIN_RESET); }
 
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, (uint16_t)(l < 0 ? -l : l));
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, (uint16_t)(r < 0 ? -r : r));
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, (uint16_t)(l < 0 ? -l : l));
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, (uint16_t)(r < 0 ? -r : r));
 }
 
 static void Motor_Stop(void) { Motor_Set(0, 0); }
