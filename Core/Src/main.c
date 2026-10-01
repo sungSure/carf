@@ -83,9 +83,12 @@
 
 /* ---------- 循迹 ---------- */
 #define TRACK_BASE        100      /* 循迹基础巡航占空比(U/J可在线调) */
-#define TRACK_K           22       /* 转向增益: 差速 = K*err, 摆动大→减, 弯道跟不上→加 */
+#define TRACK_K           28       /* 转向增益: 差速 = K*err, 摆动大→减, 弯道跟不上→加 */
 #define TRACK_DIFF_MAX    70       /* 差速限幅: 单侧加减的上限, 削峰防甩尾 */
 #define GAP_HOLD_MS       120u     /* 线在传感器间隙(全白)时保持原曲率的时间, 超过才算真丢线 */
+#define SHARP_TRIG_MS     120u     /* 最外传感器持续压线时长→判定U型急弯 */
+#define SHARP_PWM_OUT     150      /* 急弯旋转: 外侧轮速 */
+#define SHARP_PWM_IN      (-60)   /* 急弯旋转: 内侧轮速(负=倒转→小半径) */
 #define LOST_LINE_MS      2500u    /* 丢线保护时间 */
 
 /* ---------- 线事件判定 ---------- */
@@ -423,15 +426,37 @@ static uint8_t LineEvt_Task(void)
 
 /* ================= 循迹差速驱动 ================= */
 /* 加权: L2=-3 L1=-1 R1=+1 R2=+3; err>0线在右侧 → 左轮加速右转 */
+/* U型急弯: 差速再大也只是大半径弧线, 必须切原地小半径旋转(内侧轮反转) */
+static int8_t    sharp_turn = 0;     /* 急弯旋转中: +1右转 -1左转 0无(调试屏要显示) */
+
 static void Track_Drive(uint8_t reverse)
 {
     static uint32_t t_gap = 0;     /* 全白持续时长: 短=线在传感器间隙, 长=真丢线 */
+    static uint32_t t_out = 0;     /* 最外传感器持续压线时长 */
     int16_t l, r, diff;
+
+    if (sharp_turn) {              /* ---- 急弯旋转: 转到有传感器重新压线为止 ---- */
+        if (g_ir != 0 && g_ir != 0x0F) {          /* 找到线(全黑=横穿线, 继续转) */
+            sharp_turn = 0; t_gap = 0; t_out = 0;
+        } else {
+            l = (sharp_turn > 0) ? SHARP_PWM_OUT : SHARP_PWM_IN;
+            r = (sharp_turn > 0) ? SHARP_PWM_IN  : SHARP_PWM_OUT;
+            Motor_Set(l, r);
+            return;
+        }
+    }
 
     if (g_ir == 0x0F) {            /* 全黑(横线/路口): 事件机负责判定, 车直行通过 */
         diff = 0;
     } else if (g_ir == 0) {        /* 全白: 先保持原曲率滑过间隙, 持续过久才强打方向找线 */
         if (t_gap == 0) t_gap = HAL_GetTick();
+        if (last_err >= 2) {       /* 外侧压线后线消失 → U型急弯, 切旋转 */
+            sharp_turn = +1;
+            return;
+        } else if (last_err <= -2) {
+            sharp_turn = -1;
+            return;
+        }
         if (HAL_GetTick() - t_gap <= GAP_HOLD_MS)
             diff = TRACK_K * last_err;                       /* 间隙: 维持当前转向 */
         else
@@ -444,6 +469,11 @@ static void Track_Drive(uint8_t reverse)
         if (g_ir & 0x1) e += 3;
         last_err = e;
         t_gap = 0;
+        /* 最外传感器持续压线: 满差速也拉不回中心 → 急弯 */
+        if (e == 3 || e == -3) {
+            if (t_out == 0) t_out = HAL_GetTick();
+            else if (HAL_GetTick() - t_out >= SHARP_TRIG_MS) { sharp_turn = (e > 0) ? 1 : -1; t_out = 0; }
+        } else t_out = 0;
         diff = TRACK_K * e;
     }
 
@@ -662,7 +692,8 @@ static void UI_Task(void)
         OLED_PrintASCIIString(46, 44, "L1", &afont8x6, OLED_COLOR_NORMAL);
         OLED_PrintASCIIString(72, 44, "R1", &afont8x6, OLED_COLOR_NORMAL);
         OLED_PrintASCIIString(98, 44, "R2", &afont8x6, OLED_COLOR_NORMAL);
-        sprintf(buf, "E:%d K%d S%d D%d %s", last_err, TRACK_K, base_speed, TRACK_DIFF_MAX, lost_err ? "LOST" : "RUN");
+        sprintf(buf, "E:%d K%d S%d D%d %s", last_err, TRACK_K, base_speed, TRACK_DIFF_MAX,
+                sharp_turn ? "TURN" : (lost_err ? "LOST" : "RUN"));
         OLED_PrintASCIIString(4, 54, buf, &afont8x6, OLED_COLOR_NORMAL);
         break;
 #endif
