@@ -82,8 +82,10 @@
 #define SPIN_PWM          150      /* 原地转占空比 */
 
 /* ---------- 循迹 ---------- */
-#define TRACK_BASE        115      /* 循迹基础巡航占空比(U/J可在线调) */
-#define TRACK_K           40       /* 转向增益: 轮速 = base ± K*err */
+#define TRACK_BASE        100      /* 循迹基础巡航占空比(U/J可在线调) */
+#define TRACK_K           22       /* 转向增益: 差速 = K*err, 摆动大→减, 弯道跟不上→加 */
+#define TRACK_DIFF_MAX    70       /* 差速限幅: 单侧加减的上限, 削峰防甩尾 */
+#define GAP_HOLD_MS       120u     /* 线在传感器间隙(全白)时保持原曲率的时间, 超过才算真丢线 */
 #define LOST_LINE_MS      2500u    /* 丢线保护时间 */
 
 /* ---------- 线事件判定 ---------- */
@@ -423,14 +425,17 @@ static uint8_t LineEvt_Task(void)
 /* 加权: L2=-3 L1=-1 R1=+1 R2=+3; err>0线在右侧 → 左轮加速右转 */
 static void Track_Drive(uint8_t reverse)
 {
-    int16_t l, r;
+    static uint32_t t_gap = 0;     /* 全白持续时长: 短=线在传感器间隙, 长=真丢线 */
+    int16_t l, r, diff;
 
     if (g_ir == 0x0F) {            /* 全黑(横线/路口): 事件机负责判定, 车直行通过 */
-        l = base_speed; r = base_speed;
-    } else if (g_ir == 0) {         /* 丢线: 按记忆方向加强转 */
-        int8_t e = (last_err >= 0) ? 4 : -4;
-        l = base_speed + TRACK_K * e;
-        r = base_speed - TRACK_K * e;
+        diff = 0;
+    } else if (g_ir == 0) {        /* 全白: 先保持原曲率滑过间隙, 持续过久才强打方向找线 */
+        if (t_gap == 0) t_gap = HAL_GetTick();
+        if (HAL_GetTick() - t_gap <= GAP_HOLD_MS)
+            diff = TRACK_K * last_err;                       /* 间隙: 维持当前转向 */
+        else
+            diff = (last_err >= 0) ? TRACK_DIFF_MAX : -TRACK_DIFF_MAX;   /* 真丢线: 满差速 */
     } else {
         int8_t e = 0;
         if (g_ir & 0x8) e -= 3;
@@ -438,9 +443,16 @@ static void Track_Drive(uint8_t reverse)
         if (g_ir & 0x2) e += 1;
         if (g_ir & 0x1) e += 3;
         last_err = e;
-        l = base_speed + TRACK_K * e;
-        r = base_speed - TRACK_K * e;
+        t_gap = 0;
+        diff = TRACK_K * e;
     }
+
+    /* 差速限幅: 防止单侧饱和/反转造成甩尾 */
+    if (diff >  TRACK_DIFF_MAX) diff =  TRACK_DIFF_MAX;
+    if (diff < -TRACK_DIFF_MAX) diff = -TRACK_DIFF_MAX;
+
+    l = base_speed + diff;
+    r = base_speed - diff;
 
     /* 倒车循迹: 转向物理方向随行进方向反转, 公式取负即可 */
     if (reverse) { l = -l; r = -r; }
@@ -552,7 +564,7 @@ static void BT_Process(uint8_t c)
     /* --- 全局: 参数在线调整 --- */
     case 'U':                                       /* 循迹速度+10 */
         base_speed += 10;
-        if (base_speed > PWM_MAX - TRACK_K * 6) base_speed = PWM_MAX - TRACK_K * 6;
+        if (base_speed > PWM_MAX - TRACK_DIFF_MAX) base_speed = PWM_MAX - TRACK_DIFF_MAX;
         break;
     case 'J':                                       /* 循迹速度-10 */
         base_speed -= 10;
@@ -650,7 +662,7 @@ static void UI_Task(void)
         OLED_PrintASCIIString(46, 44, "L1", &afont8x6, OLED_COLOR_NORMAL);
         OLED_PrintASCIIString(72, 44, "R1", &afont8x6, OLED_COLOR_NORMAL);
         OLED_PrintASCIIString(98, 44, "R2", &afont8x6, OLED_COLOR_NORMAL);
-        sprintf(buf, "E:%d  SPD:%d  %s", last_err, base_speed, lost_err ? "LOST" : "RUN");
+        sprintf(buf, "E:%d K%d S%d D%d %s", last_err, TRACK_K, base_speed, TRACK_DIFF_MAX, lost_err ? "LOST" : "RUN");
         OLED_PrintASCIIString(4, 54, buf, &afont8x6, OLED_COLOR_NORMAL);
         break;
 #endif
