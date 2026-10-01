@@ -66,6 +66,10 @@
 #define AUTO_START_MS     3000u    /* 上电到自启延时ms, 0=禁用; 留时间摆车 */
 #define BT_ENABLE         0        /* 蓝牙模块接上后改1 */
 
+/* ---------- 调试开关 ---------- */
+#define TRACK_DBG         1        /* 1=调试模式: 延时后直接纯红外循迹, 跳过全部流程/
+                                        雷达/避障/圈计时, OLED显示传感器状态; 调完改0 */
+
 /* ---------- 电机 ---------- */
 #define PWM_MAX           199      /* TIM1 ARR, PWM满占空比 */
 
@@ -634,6 +638,22 @@ static void UI_Task(void)
     }
 
     case ST_LAP1: {
+#if TRACK_DBG
+        /* 调试页: 传感器方块(实心=压线) + 偏差 + 速度 */
+        OLED_PrintASCIIString(16, 0, "TRACK DEBUG", &afont16x8, OLED_COLOR_NORMAL);
+        for (uint8_t i = 0; i < 4; i++) {
+            uint8_t x = 14 + i * 26;
+            if ((g_ir >> (3 - i)) & 1) OLED_DrawFilledRectangle(x, 22, 24, 20, OLED_COLOR_NORMAL);
+            else                       OLED_DrawRectangle(x, 22, 24, 20, OLED_COLOR_NORMAL);
+        }
+        OLED_PrintASCIIString(20, 44, "L2", &afont8x6, OLED_COLOR_NORMAL);
+        OLED_PrintASCIIString(46, 44, "L1", &afont8x6, OLED_COLOR_NORMAL);
+        OLED_PrintASCIIString(72, 44, "R1", &afont8x6, OLED_COLOR_NORMAL);
+        OLED_PrintASCIIString(98, 44, "R2", &afont8x6, OLED_COLOR_NORMAL);
+        sprintf(buf, "E:%d  SPD:%d  %s", last_err, base_speed, lost_err ? "LOST" : "RUN");
+        OLED_PrintASCIIString(4, 54, buf, &afont8x6, OLED_COLOR_NORMAL);
+        break;
+#endif
         /* 顶部信息行 */
         sprintf(buf, "T:%lu.%01lus v:%d.%d", (unsigned long)((now - t_state) / 1000),
                 (unsigned long)(((now - t_state) / 100) % 10),
@@ -744,8 +764,13 @@ static void Main_Loop(void)
 #if !SOUND_ENABLE
         /* 无声音模块: 上电延时自动启动 */
         if (AUTO_START_MS > 0 && now - t_state >= AUTO_START_MS) {
+#if TRACK_DBG
+            last_err = 0; t_lost = 0; lost_err = 0;
+            Goto(ST_LAP1);                          /* 调试: 直接进纯循迹 */
+#else
             Motor_Set(RUN20_PWM, RUN20_PWM);
             Goto(ST_RUN20);
+#endif
         }
 #endif
         break;
@@ -786,6 +811,19 @@ static void Main_Loop(void)
         if (av != AV_IDLE) { Avoid_Task(); break; }
         /* Y路口子流程接管 */
         if (ys != YS_IDLE) { Y_Task(); break; }
+
+#if TRACK_DBG
+        /* ---- 调试模式: 只做红外循迹(保留丢线保护), 其余全跳过 ---- */
+        if (g_ir == 0) {
+            if (t_lost == 0) t_lost = now;
+            else if (now - t_lost > LOST_LINE_MS) {
+                Motor_Stop(); lost_err = 1; Buzzer_Beep(P_ERR); t_lost = 0;
+                break;
+            }
+        } else t_lost = 0;
+        Track_Drive(0);
+        break;
+#endif
 
         /* 线事件分类 */
         evt = LineEvt_Task();
