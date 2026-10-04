@@ -42,13 +42,13 @@
 /* ============ 硬件接线(与 carf.ioc / configs.txt 一致) ============ *
  * 电机: TB6612  PWMA=TIM1_CH1(PA8) 左轮  PWMB=TIM1_CH2(PA9) 右轮
  *       AIN1/2=PB12/13  BIN1/2=PB14/15  STBY=3.3V
- * 红外: PA2(L2) PA3(L1) PA4(R1) PA5(R2) 左→右, 压黑线输出低电平
+ * 红外: PA2(L2) PA3(L1) PA4(R1) PA5(R2) 左→右, 压黑线输出高电平
  * 超声: Trig=PB5  Echo=PB6(TIM4_CH1 输入捕获, 1us计数)
  * 舵机: TIM3_CH1(PA6) 50Hz, 0.5~2.5ms 对应 0~180°
- * 蜂鸣: PA12 低电平响
- * 蓝牙: USART3 PB10/11 9600
- * 声音: DO→PA15(模块未到货, 暂关)
- * ============ 蓝牙指令表(单字符, 需BT_ENABLE=1; 当前=0模块未接) ============ *
+ * 蜂鸣: PA12 低电平响(有源, 已匹配)
+ * 蓝牙: USART3 PB10/11 9600(EN/STATE悬空不接)
+ * 声音: HW-484 DO→PA15, 有声音输出高电平
+ * ============ 蓝牙指令表(单字符) ============ *
  *  G: 启动(声音关闭时的启动信号)   L/R: Y路口选左/右(默认左)
  *  M: 自动圈结束后进入手动圈       B: 完成后触发逆向返程(拓展)
  *  W/A/S/D/X: 手动圈 遥控 前/左/后/右/停
@@ -56,18 +56,17 @@
  * ==================================== */
 
 /* ---------- 启动方式(现场可改) ----------
- * SOUND_ENABLE=1  : PA15声音触发(验收要求, 模块到货后改1)
- * AUTO_START_MS>0 : 上电延时自启(当前方案: 无声音模块无蓝牙)
+ * SOUND_ENABLE=1  : PA15声音触发(验收要求, HW-484已接入)
+ * AUTO_START_MS>0 : 上电延时自启(SOUND_ENABLE=1时编译剔除, 仅备用)
  * 两者都关        : 等蓝牙'G'启动(需BT_ENABLE=1)
- * BT_ENABLE=0     : 蓝牙未接, 不挂串口接收(防悬空RX收到噪声指令);
- *                   接上模块后改1                                     */
-#define SOUND_ENABLE      0
-#define SOUND_ACTIVE      0        /* 检测到声音时DO电平(拿到模块实测后改) */
+ * BT_ENABLE=1     : 蓝牙已接 USART3(PB10/PB11, 9600)                    */
+#define SOUND_ENABLE      1
+#define SOUND_ACTIVE      1        /* HW-484: 检测到声音DO输出高电平(实测资料) */
 #define AUTO_START_MS     3000u    /* 上电到自启延时ms, 0=禁用; 留时间摆车 */
-#define BT_ENABLE         0        /* 蓝牙模块接上后改1 */
+#define BT_ENABLE         1        /* 蓝牙模块已接入 */
 
 /* ---------- 调试开关 ---------- */
-#define TRACK_DBG         1        /* 1=调试模式: 延时后直接纯红外循迹, 跳过全部流程/
+#define TRACK_DBG         0        /* 1=调试模式: 延时后直接纯红外循迹, 跳过全部流程/
                                         雷达/避障/圈计时, OLED显示传感器状态; 调完改0 */
 
 /* ---------- 电机 ---------- */
@@ -165,6 +164,7 @@ static uint8_t   lost_err = 0;       /* 丢线保护触发标志 */
 /* ---------- 红外循迹 ---------- */
 static uint8_t   g_ir;               /* 本轮采样 bit3..0 = L2 L1 R1 R2, 1=压线 */
 static int8_t    last_err = 0;       /* 记忆上次偏差(丢线找回用) */
+static uint32_t  snd_seen = 0;      /* 最近一次检测到声音的时刻(待命屏显示用) */
 static uint32_t  t_lost = 0;
 
 /* 线事件(全黑起止分类) */
@@ -653,7 +653,12 @@ static void UI_Task(void)
     case ST_STANDBY: {
         OLED_PrintASCIIString(16, 0, "== CAR READY ==", &afont12x6, OLED_COLOR_NORMAL);
 #if SOUND_ENABLE
-        OLED_PrintASCIIString(16, 20, "WAIT SOUND ...", &afont12x6, OLED_COLOR_NORMAL);
+        OLED_PrintASCIIString(16, 16, "WAIT SOUND ...", &afont12x6, OLED_COLOR_NORMAL);
+        /* 声音触发可视化: 拍手后显示ACTIVE!持续1s, 用于验证极性/灵敏度 */
+        if (now - snd_seen < 1000)
+            OLED_PrintASCIIString(22, 30, "SND: ACTIVE !", &afont12x6, OLED_COLOR_NORMAL);
+        else
+            OLED_PrintASCIIString(28, 30, "SND: ----", &afont12x6, OLED_COLOR_NORMAL);
 #elif AUTO_START_MS > 0
         uint32_t left_ms = (now - t_state >= AUTO_START_MS) ? 0
                                                        : (AUTO_START_MS - (now - t_state));
@@ -663,7 +668,7 @@ static void UI_Task(void)
         OLED_PrintASCIIString(10, 20, "BT 'G' TO START", &afont12x6, OLED_COLOR_NORMAL);
 #endif
         sprintf(buf, "Y-%s  SPD:%d", y_choice_left ? "L" : "R", base_speed);
-        OLED_PrintASCIIString(10, 40, buf, &afont12x6, OLED_COLOR_NORMAL);
+        OLED_PrintASCIIString(10, 48, buf, &afont12x6, OLED_COLOR_NORMAL);
         break;
     }
 
@@ -784,16 +789,19 @@ static void Main_Loop(void)
     Radar_Task();
     UI_Task();
 
-    /* ---- 声音启动检测(启用时): PA15 活动电平持续30ms ---- */
+    /* ---- 声音检测(启用时): PA15 活动电平持续30ms才启动, 防误触发 ---- */
 #if SOUND_ENABLE
-    if (state == ST_STANDBY) {
+    {
         static uint32_t t_snd = 0;
         if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_15) == (GPIO_PinState)SOUND_ACTIVE) {
-            if (t_snd == 0) t_snd = now;
-            else if (now - t_snd >= 30) {
-                t_snd = 0;
-                Motor_Set(RUN20_PWM, RUN20_PWM);
-                Goto(ST_RUN20);
+            snd_seen = now;                       /* 记录, 待命屏显示1s */
+            if (state == ST_STANDBY) {
+                if (t_snd == 0) t_snd = now;
+                else if (now - t_snd >= 30) {
+                    t_snd = 0;
+                    Motor_Set(RUN20_PWM, RUN20_PWM);
+                    Goto(ST_RUN20);
+                }
             }
         } else t_snd = 0;
     }
