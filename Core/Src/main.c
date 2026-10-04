@@ -1037,7 +1037,8 @@ int main(void)
 #endif
 
 #if SOUND_ENABLE
-  /* PA15原为JTDI, 需释放JTAG保留SWD后才可作GPIO */
+  /* PA15初始化(CubeMX未配置此脚)。SWJ_NOJTAG重映射在 hal_msp.c 里CubeMX已做
+     (SYS=Serial Wire), 此处再写一次属冗余保险, 保证本块自包含 */
   __HAL_RCC_AFIO_CLK_ENABLE();
   __HAL_AFIO_REMAP_SWJ_NOJTAG();
   {
