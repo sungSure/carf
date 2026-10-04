@@ -62,6 +62,7 @@
  * BT_ENABLE=1     : 蓝牙已接 USART3(PB10/PB11, 9600)                    */
 #define SOUND_ENABLE      1
 #define SOUND_ACTIVE      1        /* HW-484: 检测到声音DO输出高电平(实测资料) */
+#define SND_TEST_MS       6000u   /* 上电声音自检时长ms(显示DO电平+脉冲计数), 0=跳过 */
 #define AUTO_START_MS     3000u    /* 上电到自启延时ms, 0=禁用; 留时间摆车 */
 #define BT_ENABLE         1        /* 蓝牙模块已接入 */
 
@@ -655,7 +656,7 @@ static void UI_Task(void)
 #if SOUND_ENABLE
         OLED_PrintASCIIString(16, 16, "WAIT SOUND ...", &afont12x6, OLED_COLOR_NORMAL);
         /* 声音触发可视化: 拍手后显示ACTIVE!持续1s, 用于验证极性/灵敏度 */
-        if (now - snd_seen < 1000)
+        if (snd_seen != 0 && now - snd_seen < 1000)
             OLED_PrintASCIIString(22, 30, "SND: ACTIVE !", &afont12x6, OLED_COLOR_NORMAL);
         else
             OLED_PrintASCIIString(28, 30, "SND: ----", &afont12x6, OLED_COLOR_NORMAL);
@@ -1056,6 +1057,38 @@ int main(void)
   OLED_NewFrame();
   OLED_ShowFrame();
   ui_init = 1;
+
+#if SOUND_ENABLE && SND_TEST_MS > 0
+  /* ---- 上电声音自检: 无论是否触发都等满时长, 实时显示DO电平+跳变计数 ----
+   * 判读: 拍手时 DO 变 HIGH 且 PULSES 增加 → 极性对(SOUND_ACTIVE=1)
+   *       拍手时 DO 变 LOW(平时HIGH)     → 极性反了, SOUND_ACTIVE 改 0
+   *       DO 恒 LOW/恒 HIGH 且 PULSES 不动 → 查接线/供电/灵敏度电位器        */
+  {
+    char tbuf[24];
+    GPIO_PinState lvl = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_15);
+    uint32_t t0 = HAL_GetTick(), t_ui = 0;
+    uint16_t pulses = 0;
+
+    while (HAL_GetTick() - t0 < SND_TEST_MS) {
+      GPIO_PinState cur = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_15);
+      if (cur != lvl) { lvl = cur; pulses++; }         /* 电平跳变计数 */
+      uint32_t n = HAL_GetTick();
+      if (n - t_ui >= 100) {                           /* 10Hz 刷新屏幕 */
+        t_ui = n;
+        OLED_NewFrame();
+        sprintf(tbuf, "SND TEST %us",
+                (unsigned)((SND_TEST_MS - (n - t0) + 999u) / 1000u));
+        OLED_PrintASCIIString(16, 0, tbuf, &afont16x8, OLED_COLOR_NORMAL);
+        sprintf(tbuf, "DO: %s", lvl ? "HIGH" : "LOW");
+        OLED_PrintASCIIString(28, 20, tbuf, &afont16x8, OLED_COLOR_NORMAL);
+        sprintf(tbuf, "PULSES: %u", (unsigned)pulses);
+        OLED_PrintASCIIString(28, 42, tbuf, &afont12x6, OLED_COLOR_NORMAL);
+        OLED_PrintASCIIString(34, 56, "CLAP TO TEST", &afont8x6, OLED_COLOR_NORMAL);
+        OLED_ShowFrame();
+      }
+    }
+  }
+#endif
 
   Goto(ST_STANDBY);
   t_lost = 0;
