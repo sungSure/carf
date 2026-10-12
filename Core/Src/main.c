@@ -6,8 +6,9 @@
   ******************************************************************************
   * @attention
   *
-  * 流程: 待命 → 启动(上电延时自启 / PA15声音 / 蓝牙'G') → 直行20cm → 停车计时5s → 蜂鸣
-  *       → 第1圈自动循迹(雷达扫描+点云图+Y路口+避障) → 回起点停车
+  * 流程: 待命 → 启动(PA15声音) → 直行20cm → 停车计时5s → 蜂鸣
+  *       → 去程循迹(雷达扫描+点云图+Y路口分叉识别+避障) → 到终点横线停车
+  *       → 原地掉头 → 沿原路返回起点横线停车(记去程/返程/总时)
   *       → 第2圈手动遥控(蓝牙) → 数据显示 → (拓展)逆向循迹返程
   *
   * 架构: 主循环无阻塞, 全部基于 HAL_GetTick() 时间片调度
@@ -63,7 +64,7 @@
 #define SOUND_ENABLE      1
 #define SOUND_ACTIVE      1        /* HW-484: 检测到声音DO输出高电平(实测资料) */
 #define SND_TEST_MS       0   /* 上电声音自检时长ms(显示DO电平+脉冲计数), 0=跳过 */
-#define SND_HOLD_MS       10u  /* 声音触发启动: 活动电平需持续时长ms(越小越灵敏, 太小易误触发) */
+#define SND_HOLD_MS       1u  /* 声音触发启动: 活动电平需持续时长ms(越小越灵敏, 太小易误触发) */
 #define AUTO_START_MS     3000u    /* 上电到自启延时ms, 0=禁用; 留时间摆车 */
 #define BT_ENABLE         1        /* 蓝牙模块已接入 */
 
@@ -93,9 +94,13 @@
 #define LOST_LINE_MS      2500u    /* 丢线保护时间 */
 
 /* ---------- 线事件判定 ---------- */
-#define LINE_MARK_MS       60u      /* 全黑持续<此值 → 横线(起点/终点) */
-#define JUNCTION_MS       200u     /* 全黑持续≥此值 → 宽路口(Y) */
-#define MIN_LAP_MS        15000u   /* 圈内最早接受"终点"的时间 */
+#define LINE_MARK_MAX_MS  250u     /* 全黑持续<此值 → 横线(起点/终点); 超时按宽黑区处理 */
+#define FORK_MIN_MS        40u     /* 分叉图案"黑-白-黑"持续此值 → Y路口(两线分叉型) */
+#define MIN_LAP_MS        15000u   /* 去程最早接受"终点"的时间 */
+#define MIN_RET_MS         1500u   /* 返程最早接受"起点"的时间 */
+#define RET_TURN_MS       900u     /* 终点原地掉头180°的旋转时长(现场标定: 掉头不准则调此值) */
+#define RET_TURN_PWM      150      /* 掉头旋转轮速(左正右负, 原地转) */
+#define RET_ACQ_MS        2000u    /* 掉头后重新找线的时限; 超时则按丢线保护处理 */
 
 /* ---------- 避障 ---------- */
 #define AVOID_TRIGGER_CM  40.0f    /* 前方距离阈值(含雷达刷新延迟余量) */
@@ -131,7 +136,8 @@ typedef enum {
     ST_STANDBY,       /* 待命等启动信号 */
     ST_RUN20,         /* 直行20cm */
     ST_WAIT5,         /* 停车计时5s */
-    ST_LAP1,          /* 自动圈: 循迹+雷达+避障+Y路口 */
+    ST_LAP1,          /* 自动圈去程: 循迹+雷达+避障+Y路口选择 */
+    ST_RETURN,        /* 终点掉头, 沿原路返回起点并停车 */
     ST_LAP1_DONE,     /* 自动圈完成, 等M/B指令 */
     ST_MANUAL,        /* 手动遥控圈 */
     ST_FINISHED,      /* 全部完成, 显示数据 */
@@ -169,12 +175,21 @@ static int8_t    last_err = 0;       /* 记忆上次偏差(丢线找回用) */
 static uint32_t  snd_seen = 0;      /* 最近一次检测到声音的时刻(待命屏显示用) */
 static uint32_t  t_lost = 0;
 
-/* 线事件(全黑起止分类) */
+/* 线事件(横线 / 分叉路口) */
 static struct {
-    uint8_t  in_black;
-    uint8_t  fired_junction;
-    uint32_t t_start;
+    uint8_t  in_black;       /* 全黑进行中 */
+    uint8_t  in_fork;        /* 分叉图案进行中 */
+    uint8_t  fired;          /* 本次事件已上报(防重复) */
+    uint32_t t_black;
+    uint32_t t_fork;
 } le;
+
+/* 回到起点子流程 */
+typedef enum { RT_TURN, RT_REACQ, RT_TRACK } RetStep;
+static RetStep   rt = RT_TURN;
+static uint32_t  rt_t;               /* 当前返回子步骤起始时刻 */
+static uint32_t  out_ms = 0;         /* 去程用时(起点→终点) */
+static uint32_t  back_ms = 0;        /* 返程用时(终点→起点) */
 
 /* ---------- 避障 / Y ---------- */
 static AvoidStep av = AV_IDLE;
@@ -405,25 +420,48 @@ static uint8_t IR_Read(void)
 static void LineEvt_Reset(void)
 {
     le.in_black = 0;
-    le.fired_junction = 0;
-    le.t_start = 0;
+    le.in_fork  = 0;
+    le.fired    = 0;
+    le.t_black  = 0;
+    le.t_fork   = 0;
 }
 
-/* 全黑起止分类: 短黑=横线(1), 持续黑=宽路口(2) */
+/* 分叉图案识别: 4路按 L2 L1 R1 R2 顺序中若出现"黑-白-黑"(中间有白),
+   说明传感器下同时有两条分离的黑线 → Y路口分叉。
+   正常循迹时压到的黑线是连续一段, 不会出现中间空洞。 */
+static uint8_t IR_Fork(uint8_t v)
+{
+    int8_t l = -1, r = -1;
+    for (uint8_t i = 0; i < 4; i++) {
+        if ((v >> (3 - i)) & 1) { if (l < 0) l = (int8_t)i; r = (int8_t)i; }
+    }
+    if (l < 0 || (r - l) < 2) return 0;              /* 无黑 或 连续黑 */
+    for (uint8_t i = (uint8_t)l + 1; i < (uint8_t)r; i++)
+        if (!((v >> (3 - i)) & 1)) return 1;         /* 中间有白 → 分叉 */
+    return 0;
+}
+
+/* 事件: 1=横线(起点/终点, 短全黑) 2=Y路口(分叉图案 或 超长全黑区) */
 static uint8_t LineEvt_Task(void)
 {
     uint32_t now = HAL_GetTick();
+    uint8_t  evt = 0;
+
+    /* --- Y路口(分叉型): 黑-白-黑 持续 FORK_MIN_MS --- */
+    if (IR_Fork(g_ir)) {
+        if (!le.in_fork) { le.in_fork = 1; le.fired = 0; le.t_fork = now; }
+        else if (!le.fired && now - le.t_fork >= FORK_MIN_MS) { le.fired = 1; evt = 2; }
+    } else le.in_fork = 0;
+
+    /* --- 横线(起点/终点): 全黑出现后短时间结束 --- */
     if (g_ir == 0x0F) {
-        if (!le.in_black) { le.in_black = 1; le.t_start = now; le.fired_junction = 0; }
-        else if (!le.fired_junction && now - le.t_start >= JUNCTION_MS) {
-            le.fired_junction = 1;
-            return 2;
-        }
+        if (!le.in_black) { le.in_black = 1; le.fired = 0; le.t_black = now; }
+        else if (!le.fired && now - le.t_black >= LINE_MARK_MAX_MS) { le.fired = 1; evt = 2; }
     } else if (le.in_black) {
         le.in_black = 0;
-        if (!le.fired_junction) return 1;   /* 短全黑结束 → 横线 */
+        if (!le.fired) evt = 1;                      /* 短全黑 → 横线 */
     }
-    return 0;
+    return evt;
 }
 
 /* ================= 循迹差速驱动 ================= */
@@ -726,13 +764,26 @@ static void UI_Task(void)
         break;
     }
 
+    case ST_RETURN:
+        OLED_PrintASCIIString(20, 0, "RETURNING", &afont16x8, OLED_COLOR_NORMAL);
+        sprintf(buf, "OUT: %lu.%01lus", (unsigned long)(out_ms / 1000), (unsigned long)((out_ms / 100) % 10));
+        OLED_PrintASCIIString(10, 18, buf, &afont12x6, OLED_COLOR_NORMAL);
+        sprintf(buf, "T: %lu.%01lus", (unsigned long)((now - t_state) / 1000),
+                (unsigned long)(((now - t_state) / 100) % 10));
+        OLED_PrintASCIIString(10, 32, buf, &afont12x6, OLED_COLOR_NORMAL);
+        OLED_PrintASCIIString(10, 50, rt == RT_TURN ? "TURN AROUND" : "BACK TO START", &afont8x6, OLED_COLOR_NORMAL);
+        break;
+
     case ST_LAP1_DONE:
-        OLED_PrintASCIIString(28, 0, "LAP1 DONE", &afont16x8, OLED_COLOR_NORMAL);
-        sprintf(buf, "LAP1: %lu.%01lus", (unsigned long)(lap1_ms / 1000), (unsigned long)((lap1_ms / 100) % 10));
-        OLED_PrintASCIIString(10, 20, buf, &afont12x6, OLED_COLOR_NORMAL);
-        sprintf(buf, "v: %d.%d cm/s", (int)speed_calib, (int)(speed_calib * 10) % 10);
-        OLED_PrintASCIIString(10, 34, buf, &afont12x6, OLED_COLOR_NORMAL);
-        OLED_PrintASCIIString(4, 48, "BT 'M':manual 'B':rev", &afont8x6, OLED_COLOR_NORMAL);
+        OLED_PrintASCIIString(24, 0, "LAP1 DONE", &afont16x8, OLED_COLOR_NORMAL);
+        sprintf(buf, "OUT: %lu.%01lus", (unsigned long)(out_ms / 1000), (unsigned long)((out_ms / 100) % 10));
+        OLED_PrintASCIIString(10, 18, buf, &afont12x6, OLED_COLOR_NORMAL);
+        sprintf(buf, "RET: %lu.%01lus", (unsigned long)(back_ms / 1000), (unsigned long)((back_ms / 100) % 10));
+        OLED_PrintASCIIString(10, 30, buf, &afont12x6, OLED_COLOR_NORMAL);
+        sprintf(buf, "TOT: %lu.%01lus", (unsigned long)((out_ms + back_ms) / 1000),
+                (unsigned long)(((out_ms + back_ms) / 100) % 10));
+        OLED_PrintASCIIString(10, 42, buf, &afont12x6, OLED_COLOR_NORMAL);
+        OLED_PrintASCIIString(4, 54, "BT 'M':man 'B':rev", &afont8x6, OLED_COLOR_NORMAL);
         break;
 
     case ST_MANUAL:
@@ -898,13 +949,17 @@ static void Main_Loop(void)
             break;
         }
 
-        /* 横线 = 回到起点(圈时保护) */
+        /* 终点横线: 停车记时 → 掉头返回起点 */
         if (evt == 1 && lap > MIN_LAP_MS) {
             Motor_Stop();
             Radar_Disable();
-            lap1_ms = lap;
+            out_ms   = lap;                         /* 去程用时 */
+            lost_err = 0;
+            t_lost   = 0;
+            rt       = RT_TURN;
+            rt_t     = now;
             Buzzer_Beep(P_LAP);
-            Goto(ST_LAP1_DONE);
+            Goto(ST_RETURN);
             break;
         }
 
@@ -921,6 +976,63 @@ static void Main_Loop(void)
         } else t_lost = 0;
 
         Track_Drive(0);
+        break;
+    }
+
+    case ST_RETURN: {                               /* 终点掉头 → 沿原路返回起点 */
+        uint8_t  evt;
+
+        /* 丢线保护触发后停车, 人工把车放回线上自动恢复 */
+        if (lost_err) {
+            Motor_Stop();
+            if (g_ir != 0 && g_ir != 0x0F) { lost_err = 0; t_lost = 0; }
+            break;
+        }
+
+        switch (rt) {
+        case RT_TURN:                               /* 原地掉头180° */
+            Motor_Set(RET_TURN_PWM, -RET_TURN_PWM);
+            if (now - rt_t >= RET_TURN_MS) {
+                Motor_Stop();
+                LineEvt_Reset();                    /* 清掉停在终点线上产生的黑事件 */
+                t_lost = 0;
+                rt = RT_REACQ; rt_t = now;
+            }
+            break;
+
+        case RT_REACQ:                              /* 前进离开终点线, 直到重新压到循迹线 */
+            Motor_Set(TRACK_BASE / 2, TRACK_BASE / 2);
+            if (g_ir != 0 && g_ir != 0x0F) {        /* 重新看到单条黑线 → 接管循迹 */
+                rt = RT_TRACK; rt_t = now; t_lost = 0;
+            } else if (now - rt_t > RET_ACQ_MS) {   /* 时限内找不到线 → 交丢线保护 */
+                Motor_Stop();
+                lost_err = 1;
+                Buzzer_Beep(P_ERR);
+            }
+            break;
+
+        default:
+        case RT_TRACK:                              /* 正常循迹返回, 检测起点横线 */
+            evt = LineEvt_Task();
+            if (evt == 1 && now - rt_t > MIN_RET_MS) {
+                Motor_Stop();
+                back_ms = now - t_state;            /* 返程用时(含掉头) */
+                lap1_ms = out_ms + back_ms;         /* 自动圈总时 */
+                Buzzer_Beep(P_DONE);
+                Goto(ST_LAP1_DONE);
+                break;
+            }
+            /* 丢线保护 */
+            if (g_ir == 0) {
+                if (t_lost == 0) t_lost = now;
+                else if (now - t_lost > LOST_LINE_MS) {
+                    Motor_Stop(); lost_err = 1; Buzzer_Beep(P_ERR); t_lost = 0;
+                    break;
+                }
+            } else t_lost = 0;
+            Track_Drive(0);
+            break;
+        }
         break;
     }
 
