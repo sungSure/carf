@@ -103,9 +103,12 @@
 #define LOST_LINE_MS      2500u    /* 丢线保护时间 */
 
 /* ---------- 线事件判定 ---------- */
-#define LINE_MARK_MAX_MS  250u     /* 全黑持续<此值 → 横线(起点/终点); 超时按宽黑区处理 */
-#define FORK_MIN_MS        40u     /* 分叉图案"黑-白-黑"持续此值 → Y路口(两线分叉型) */
-#define MIN_LAP_MS        15000u   /* 去程最早接受"终点"的时间 */
+/* 实测(一圈蓝牙录制): 单个特征事件都很短——分叉 1001 仅持续 37ms, 终点全黑仅 ~20ms,
+   且传感器多数时间(62%)读到全白(线常落在探头间隙), 所以阈值不能按"大黑块"取。 */
+#define LINE_MARK_MIN_MS    8u     /* 宽黑持续≥此值即判为横线(起点/终点), 实测仅~20ms */
+#define WIDE_MIN_CNT       3u      /* ≥此路同时压黑 视为"宽黑"(终点横线/路口), 1~2路为普通循迹 */
+#define FORK_MIN_MS        15u     /* 分叉图案持续此值 → Y路口(实测37ms, 取小值防漏判) */
+#define MIN_LAP_MS         6000u   /* 去程最早接受"终点"的时间(实测整圈约12.7s, 原15s会直接漏掉终点!) */
 #define MIN_RET_MS         1500u   /* 返程最早接受"起点"的时间 */
 #define RET_TURN_MS       900u     /* 终点原地掉头180°的旋转时长(现场标定: 掉头不准则调此值) */
 #define RET_TURN_PWM      150      /* 掉头旋转轮速(左正右负, 原地转) */
@@ -455,22 +458,33 @@ static void LineEvt_Reset(void)
     le.t_fork   = 0;
 }
 
-/* 分叉图案识别: 4路按 L2 L1 R1 R2 顺序中若出现"黑-白-黑"(中间有白),
-   说明传感器下同时有两条分离的黑线 → Y路口分叉。
-   正常循迹时压到的黑线是连续一段, 不会出现中间空洞。 */
+/* 分叉图案识别: 4路按 L2 L1 R1 R2 顺序。
+   分叉口 = 传感器下同时有两条分离的黑线 → 黑线分居左右两侧、中间夹白。
+   实测数据: 正常循迹几乎只出现"单路压线"(相邻两路同时黑都极少见),
+             分叉瞬间表现为 L2+R2 同时黑(中间 L1 R1 白), 仅持续几十ms。
+   条件: 恰好2路黑 + 一左一右跨中 + 非相邻(中间有白)。 */
 static uint8_t IR_Fork(uint8_t v)
 {
-    int8_t l = -1, r = -1;
+    int8_t  l = -1, r = -1;
+    uint8_t cnt = 0;
     for (uint8_t i = 0; i < 4; i++) {
-        if ((v >> (3 - i)) & 1) { if (l < 0) l = (int8_t)i; r = (int8_t)i; }
+        if ((v >> (3 - i)) & 1) { cnt++; if (l < 0) l = (int8_t)i; r = (int8_t)i; }
     }
-    if (l < 0 || (r - l) < 2) return 0;              /* 无黑 或 连续黑 */
-    for (uint8_t i = (uint8_t)l + 1; i < (uint8_t)r; i++)
-        if (!((v >> (3 - i)) & 1)) return 1;         /* 中间有白 → 分叉 */
-    return 0;
+    if (cnt != 2)   return 0;                    /* 恰好2路黑 */
+    if (r - l < 2)  return 0;                    /* 必须非相邻(中间有白) */
+    if (l > 1 || r < 2) return 0;                /* 必须一左一右跨中 */
+    return 1;
 }
 
-/* 事件: 1=横线(起点/终点, 短全黑) 2=Y路口(分叉图案 或 超长全黑区) */
+/* 宽黑: ≥WIDE_MIN_CNT 路同时压黑 → 终点横线/宽路口 (普通循迹最多1~2路) */
+static uint8_t IR_Wide(uint8_t v)
+{
+    uint8_t cnt = 0;
+    for (uint8_t i = 0; i < 4; i++) if ((v >> i) & 1) cnt++;
+    return (cnt >= WIDE_MIN_CNT);
+}
+
+/* 事件: 1=横线(起点/终点, 宽黑) 2=Y路口(分叉图案) */
 static uint8_t LineEvt_Task(void)
 {
     uint32_t now = HAL_GetTick();
@@ -482,14 +496,13 @@ static uint8_t LineEvt_Task(void)
         else if (!le.fired && now - le.t_fork >= FORK_MIN_MS) { le.fired = 1; evt = 2; }
     } else le.in_fork = 0;
 
-    /* --- 横线(起点/终点): 全黑出现后短时间结束 --- */
-    if (g_ir == 0x0F) {
+    /* --- 横线(起点/终点): ≥WIDE_MIN_CNT 路同时压黑, 持续 LINE_MARK_MIN_MS 即判定 ---
+       在"仍压在宽黑上"时就判定(而非等它结束), 这样车停在线正上方, 也不会因为
+       采样刚好错过"结束瞬间"而漏掉终点。 */
+    if (IR_Wide(g_ir)) {
         if (!le.in_black) { le.in_black = 1; le.fired = 0; le.t_black = now; }
-        else if (!le.fired && now - le.t_black >= LINE_MARK_MAX_MS) { le.fired = 1; evt = 2; }
-    } else if (le.in_black) {
-        le.in_black = 0;
-        if (!le.fired) evt = 1;                      /* 短全黑 → 横线 */
-    }
+        else if (!le.fired && now - le.t_black >= LINE_MARK_MIN_MS) { le.fired = 1; evt = 1; }
+    } else le.in_black = 0;
     return evt;
 }
 
@@ -505,7 +518,7 @@ static void Track_Drive(uint8_t reverse)
     int16_t l, r, diff;
 
     if (sharp_turn) {              /* ---- 急弯旋转: 转到有传感器重新压线为止 ---- */
-        if (g_ir != 0 && g_ir != 0x0F) {          /* 找到线(全黑=横穿线, 继续转) */
+        if (g_ir != 0 && !IR_Wide(g_ir)) {        /* 找到线(宽黑=横穿线, 继续转) */
             sharp_turn = 0; t_gap = 0; t_out = 0;
         } else {
             l = (sharp_turn > 0) ? SHARP_PWM_OUT : SHARP_PWM_IN;
@@ -515,7 +528,7 @@ static void Track_Drive(uint8_t reverse)
         }
     }
 
-    if (g_ir == 0x0F) {            /* 全黑(横线/路口): 事件机负责判定, 车直行通过 */
+    if (IR_Wide(g_ir)) {           /* 宽黑(横线/路口): 事件机负责判定, 车直行通过 */
         diff = 0;
     } else if (g_ir == 0) {        /* 全白: 先保持原曲率滑过间隙, 持续过久才强打方向找线 */
         if (t_gap == 0) t_gap = HAL_GetTick();
@@ -1088,8 +1101,8 @@ static void Main_Loop(void)
             break;
         }
 
-        /* Y路口: 宽黑且本圈未处理 */
-        if (evt == 2 && lap > 3000 && !y_fired) {
+        /* Y路口(分叉): 本圈未处理过 */
+        if (evt == 2 && lap > 1500 && !y_fired) {
             y_fired = 1;
             if (y_choice_left) Motor_Set(base_speed / 4, base_speed);       /* 左分支 */
             else               Motor_Set(base_speed, base_speed / 4);       /* 右分支 */
@@ -1189,6 +1202,14 @@ static void Main_Loop(void)
         uint32_t lap = now - t_state;
         uint8_t  evt = LineEvt_Task();
         uint8_t  stop = 0;
+
+        /* 事件即时打点(便于核对分叉/终点触发时刻): 出现即经蓝牙发一行 */
+        if (evt) {
+            char eb[40];
+            sprintf(eb, "#EVT t=%lums evt=%u ir=%u%u%u%u\r\n", (unsigned long)lap, (unsigned)evt,
+                    (g_ir >> 3) & 1, (g_ir >> 2) & 1, (g_ir >> 1) & 1, g_ir & 1);
+            Rec_Send(eb);
+        }
 
         /* 丢线保护: 停车, 人工放回线上自动恢复 */
         if (lost_err) {
