@@ -71,6 +71,13 @@
 /* ---------- 调试开关 ---------- */
 #define TRACK_DBG         0        /* 1=调试模式: 延时后直接纯红外循迹, 跳过全部流程/
                                         雷达/避障/圈计时, OLED显示传感器状态; 调完改0 */
+#define REC_DBG           1        /* 1=录制模式(临时诊断): 声控启动后纯循迹, 记录传感器
+                                        变化沿, 到终点横线或录满后经蓝牙(USART3)回传文本;
+                                        与 TRACK_DBG 互斥; 采完改0恢复验收流程 */
+
+/* ---------- 数据录制(临时诊断) ---------- */
+#define REC_MAX           2000u    /* 最大记录条数(仅记变化沿), 每条3字节 ≈6KB RAM */
+#define REC_MIN_GAP_MS    2u       /* 最小记录间隔ms(抗传感器抖动) */
 
 /* ---------- 电机 ---------- */
 #define PWM_MAX           199      /* TIM1 ARR, PWM满占空比 */
@@ -138,6 +145,7 @@ typedef enum {
     ST_WAIT5,         /* 停车计时5s */
     ST_LAP1,          /* 自动圈去程: 循迹+雷达+避障+Y路口选择 */
     ST_RETURN,        /* 终点掉头, 沿原路返回起点并停车 */
+    ST_RECORD,        /* 临时: 纯循迹并录制传感器数据(诊断用) */
     ST_LAP1_DONE,     /* 自动圈完成, 等M/B指令 */
     ST_MANUAL,        /* 手动遥控圈 */
     ST_FINISHED,      /* 全部完成, 显示数据 */
@@ -190,6 +198,17 @@ static RetStep   rt = RT_TURN;
 static uint32_t  rt_t;               /* 当前返回子步骤起始时刻 */
 static uint32_t  out_ms = 0;         /* 去程用时(起点→终点) */
 static uint32_t  back_ms = 0;        /* 返程用时(终点→起点) */
+
+#if REC_DBG
+/* ---------- 传感器录制(仅记录变化沿) ---------- */
+static uint16_t  rec_t[REC_MAX];     /* 相对起点的时间戳ms(16位, 65s回绕) */
+static uint8_t   rec_v[REC_MAX];     /* 4位传感器值: bit3=L2 bit2=L1 bit1=R1 bit0=R2 */
+static uint16_t  rec_n   = 0;        /* 已记录条数 */
+static uint32_t  rec_t0  = 0;        /* 录制起点(HAL tick), 首个采样时确定 */
+static uint8_t   rec_started = 0;    /* 已采到第一条 */
+static uint8_t   rec_done = 0;       /* 录制已结束(不再采样) */
+static uint8_t   rec_full = 0;       /* 缓冲已满被截断 */
+#endif
 
 /* ---------- 避障 / Y ---------- */
 static AvoidStep av = AV_IDLE;
@@ -259,6 +278,11 @@ static void Y_Task(void);
 static void BT_Process(uint8_t c);
 static void UI_Task(void);
 static void Main_Loop(void);
+#if REC_DBG
+static void Rec_Sample(uint32_t now);
+static void Rec_Dump(void);
+static void Rec_Reset(void);
+#endif
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -674,6 +698,19 @@ static void BT_Process(uint8_t c)
     case 'D': if (state == ST_MANUAL) Motor_Set( SPIN_PWM, -SPIN_PWM);     break;
     case 'X': if (state == ST_MANUAL) Motor_Stop();                        break;
 
+#if REC_DBG
+    /* --- 录制模式控制 --- */
+    case 'P':                                       /* 立即回传已录数据 */
+        Motor_Stop();
+        Rec_Dump();
+        break;
+    case 'C':                                       /* 清空并重新开始录制 */
+        Motor_Stop();
+        Rec_Reset();
+        Goto(ST_RECORD);
+        break;
+#endif
+
     default: break;
     }
 }
@@ -682,7 +719,11 @@ static void BT_Process(uint8_t c)
 static void UI_Task(void)
 {
     uint32_t now = HAL_GetTick();
-    if (now - ui_t < UI_PERIOD_MS) return;
+    uint32_t period = UI_PERIOD_MS;
+#if REC_DBG
+    if (state == ST_RECORD) period = 1000u;   /* 录制时降低刷屏频率, 缩小I2C阻塞盲区 */
+#endif
+    if (now - ui_t < period) return;
     ui_t = now;
     if (!ui_init) return;
 
@@ -774,6 +815,21 @@ static void UI_Task(void)
         OLED_PrintASCIIString(10, 50, rt == RT_TURN ? "TURN AROUND" : "BACK TO START", &afont8x6, OLED_COLOR_NORMAL);
         break;
 
+#if REC_DBG
+    case ST_RECORD:
+        OLED_PrintASCIIString(20, 0, "RECORDING", &afont16x8, OLED_COLOR_NORMAL);
+        for (uint8_t i = 0; i < 4; i++) {
+            uint8_t x = 14 + i * 26;
+            if ((g_ir >> (3 - i)) & 1) OLED_DrawFilledRectangle(x, 18, 24, 18, OLED_COLOR_NORMAL);
+            else                       OLED_DrawRectangle(x, 18, 24, 18, OLED_COLOR_NORMAL);
+        }
+        sprintf(buf, "n:%u  t:%lus  %s", (unsigned)rec_n,
+                (unsigned long)((now - t_state) / 1000), rec_full ? "FULL" : "REC");
+        OLED_PrintASCIIString(4, 40, buf, &afont8x6, OLED_COLOR_NORMAL);
+        OLED_PrintASCIIString(4, 52, "BT 'P':dump 'C':clr", &afont8x6, OLED_COLOR_NORMAL);
+        break;
+#endif
+
     case ST_LAP1_DONE:
         OLED_PrintASCIIString(24, 0, "LAP1 DONE", &afont16x8, OLED_COLOR_NORMAL);
         sprintf(buf, "OUT: %lu.%01lus", (unsigned long)(out_ms / 1000), (unsigned long)((out_ms / 100) % 10));
@@ -830,6 +886,60 @@ static void UI_Task(void)
     OLED_ShowFrame();
 }
 
+#if REC_DBG
+/* ================= 传感器录制(临时诊断) =================
+ * 采样策略: 主循环每次迭代采样 g_ir, 仅当值与上条记录不同且距上条≥REC_MIN_GAP_MS
+ *           时记录一条(时间戳+4位值), 记录的是"变化沿"序列, 数据量小且能无损还原方波。
+ * 蓝牙回传(USART3, 9600): 文本, 每行 "t,pattern"
+ *   t       = 相对录制起点的时间ms
+ *   pattern = 4 个字符, 依次 L2 L1 R1 R2 (1=压到黑线, 0=白地)
+ * 例:  0,0000
+ *      12,1000      ← 左2(最外左)压线
+ *      37,1001      ← 左右最外侧同时压线(分叉口特征)
+ */
+static void Rec_Sample(uint32_t now)
+{
+    if (rec_done) return;
+    if (!rec_started) {                            /* 第一条: 以当前时刻为录制起点 */
+        rec_started = 1; rec_t0 = now;
+        rec_t[0] = 0; rec_v[0] = g_ir; rec_n = 1;
+        return;
+    }
+    uint16_t t = (uint16_t)(now - rec_t0);
+    if (g_ir == rec_v[rec_n - 1]) return;                            /* 值未变化 */
+    if ((uint16_t)(t - rec_t[rec_n - 1]) < REC_MIN_GAP_MS) return;  /* 抗传感器抖动 */
+    if (rec_n >= REC_MAX) { rec_full = 1; rec_done = 1; return; }
+    rec_t[rec_n] = t; rec_v[rec_n] = g_ir; rec_n++;
+}
+
+static void Rec_Send(const char *s)
+{
+    HAL_UART_Transmit(&huart3, (uint8_t *)s, (uint16_t)strlen(s), 2000);
+}
+
+/* 经蓝牙回传全部记录 */
+static void Rec_Dump(void)
+{
+    char b[40];
+    sprintf(b, "\r\n#REC n=%u full=%u gap=%ums\r\n", (unsigned)rec_n,
+            (unsigned)rec_full, (unsigned)REC_MIN_GAP_MS);
+    Rec_Send(b);
+    Rec_Send("t,L2L1R1R2\r\n");
+    for (uint16_t i = 0; i < rec_n; i++) {
+        uint8_t v = rec_v[i];
+        sprintf(b, "%u,%d%d%d%d\r\n", (unsigned)rec_t[i],
+                (v >> 3) & 1, (v >> 2) & 1, (v >> 1) & 1, v & 1);
+        Rec_Send(b);
+    }
+    Rec_Send("#END\r\n");
+}
+
+static void Rec_Reset(void)
+{
+    rec_n = 0; rec_t0 = 0; rec_started = 0; rec_done = 0; rec_full = 0;
+}
+#endif
+
 /* ================= 主循环 ================= */
 static void Main_Loop(void)
 {
@@ -839,8 +949,15 @@ static void Main_Loop(void)
     Buzzer_Task();
     if (bt_flag) { uint8_t c = bt_data; bt_flag = 0; BT_Process(c); }
     g_ir = IR_Read();
+#if REC_DBG
+    if (state == ST_RECORD) Rec_Sample(now);      /* 录制: 每次迭代采样(仅记变化沿) */
+#endif
     Radar_Task();
     UI_Task();
+#if REC_DBG
+    /* UI_Task 内含I2C阻塞(约90ms), 刷新后再采一次, 补上阻塞期间漏掉的变化 */
+    if (state == ST_RECORD) Rec_Sample(HAL_GetTick());
+#endif
 
     /* ---- 声音检测(启用时): PA15 活动电平持续 SND_HOLD_MS 才启动, 防误触发 ---- */
 #if SOUND_ENABLE
@@ -852,8 +969,14 @@ static void Main_Loop(void)
                 if (t_snd == 0) t_snd = now;
                 else if (now - t_snd >= SND_HOLD_MS) {
                     t_snd = 0;
+#if REC_DBG
+                    Rec_Reset();
+                    last_err = 0; t_lost = 0; lost_err = 0;
+                    Goto(ST_RECORD);            /* 录制模式: 直接进纯循迹录制 */
+#else
                     Motor_Set(RUN20_PWM, RUN20_PWM);
                     Goto(ST_RUN20);
+#endif
                 }
             }
         } else t_snd = 0;
@@ -868,7 +991,11 @@ static void Main_Loop(void)
 #if !SOUND_ENABLE
         /* 无声音模块: 上电延时自动启动 */
         if (AUTO_START_MS > 0 && now - t_state >= AUTO_START_MS) {
-#if TRACK_DBG
+#if REC_DBG
+            Rec_Reset();
+            last_err = 0; t_lost = 0; lost_err = 0;
+            Goto(ST_RECORD);                        /* 录制模式 */
+#elif TRACK_DBG
             last_err = 0; t_lost = 0; lost_err = 0;
             Goto(ST_LAP1);                          /* 调试: 直接进纯循迹 */
 #else
@@ -1035,6 +1162,51 @@ static void Main_Loop(void)
         }
         break;
     }
+
+#if REC_DBG
+    case ST_RECORD: {                               /* 临时: 纯循迹 + 录制传感器数据 */
+        uint32_t lap = now - t_state;
+        uint8_t  evt = LineEvt_Task();
+
+        /* 丢线保护: 停车, 人工放回线上自动恢复 */
+        if (lost_err) {
+            Motor_Stop();
+            if (g_ir != 0 && g_ir != 0x0F) { lost_err = 0; t_lost = 0; }
+            break;
+        }
+
+        /* 录满 → 停车并回传 */
+        if (rec_full) {
+            Motor_Stop();
+            Buzzer_Beep(P_DONE);
+            Rec_Dump();
+            Goto(ST_LAP1_DONE);
+            break;
+        }
+
+        /* 终点/起点横线(启动2.5s后) → 结束录制并回传 */
+        if (evt == 1 && lap > 2500) {
+            Motor_Stop();
+            rec_done = 1;
+            Buzzer_Beep(P_DONE);
+            Rec_Dump();                             /* 阻塞回传(车已停) */
+            Goto(ST_LAP1_DONE);
+            break;
+        }
+
+        /* 丢线保护 */
+        if (g_ir == 0) {
+            if (t_lost == 0) t_lost = now;
+            else if (now - t_lost > LOST_LINE_MS) {
+                Motor_Stop(); lost_err = 1; Buzzer_Beep(P_ERR); t_lost = 0;
+                break;
+            }
+        } else t_lost = 0;
+
+        Track_Drive(0);
+        break;
+    }
+#endif
 
     case ST_LAP1_DONE:                              /* 完成自动圈, 等'M'/'B' */
         Motor_Stop();
