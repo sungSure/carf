@@ -78,6 +78,8 @@
 /* ---------- 数据录制(临时诊断) ---------- */
 #define REC_MAX           2000u    /* 最大记录条数(仅记变化沿), 每条3字节 ≈6KB RAM */
 #define REC_MIN_GAP_MS    2u       /* 最小记录间隔ms(抗传感器抖动) */
+#define REC_MAX_MS        40000u   /* 录制时长上限ms: 到点强制停车回传(防跑圈不触发终点) */
+#define REC_HB_MS         2000u    /* 蓝牙心跳间隔ms: 确认MCU→手机TX链路是否通 */
 
 /* ---------- 电机 ---------- */
 #define PWM_MAX           199      /* TIM1 ARR, PWM满占空比 */
@@ -208,6 +210,7 @@ static uint32_t  rec_t0  = 0;        /* 录制起点(HAL tick), 首个采样时�
 static uint8_t   rec_started = 0;    /* 已采到第一条 */
 static uint8_t   rec_done = 0;       /* 录制已结束(不再采样) */
 static uint8_t   rec_full = 0;       /* 缓冲已满被截断 */
+static uint32_t  rec_hb_t = 0;       /* 上次心跳时刻 */
 #endif
 
 /* ---------- 避障 / Y ---------- */
@@ -280,8 +283,10 @@ static void UI_Task(void);
 static void Main_Loop(void);
 #if REC_DBG
 static void Rec_Sample(uint32_t now);
+static void Rec_Send(const char *s);
 static void Rec_Dump(void);
 static void Rec_Reset(void);
+static void Rec_Heartbeat(uint32_t now);
 #endif
 /* USER CODE END PFP */
 
@@ -917,12 +922,27 @@ static void Rec_Send(const char *s)
     HAL_UART_Transmit(&huart3, (uint8_t *)s, (uint16_t)strlen(s), 2000);
 }
 
+/* 周期心跳: 蓝牙应每 REC_HB_MS 收到一行 "#HB ..."
+ *  收得到 → MCU→手机 TX 链路正常(问题在录制/触发)
+ *  收不到 → TX 线(PB10↔模块RXD)/波特率/模块类型(SPP vs BLE)问题
+ */
+static void Rec_Heartbeat(uint32_t now)
+{
+    if (now - rec_hb_t < REC_HB_MS) return;
+    rec_hb_t = now;
+    char b[40];
+    sprintf(b, "#HB st=%d ir=%X n=%u t=%lus\r\n", (int)state, (unsigned)g_ir,
+            (unsigned)rec_n, (unsigned long)((now - t_state) / 1000));
+    Rec_Send(b);
+}
+
 /* 经蓝牙回传全部记录 */
 static void Rec_Dump(void)
 {
-    char b[40];
-    sprintf(b, "\r\n#REC n=%u full=%u gap=%ums\r\n", (unsigned)rec_n,
-            (unsigned)rec_full, (unsigned)REC_MIN_GAP_MS);
+    char b[48];
+    sprintf(b, "\r\n#REC n=%u full=%u gap=%ums wait~%us\r\n", (unsigned)rec_n,
+            (unsigned)rec_full, (unsigned)REC_MIN_GAP_MS,
+            (unsigned)((unsigned)rec_n * 13u / 960u + 1u));
     Rec_Send(b);
     Rec_Send("t,L2L1R1R2\r\n");
     for (uint16_t i = 0; i < rec_n; i++) {
@@ -957,6 +977,7 @@ static void Main_Loop(void)
 #if REC_DBG
     /* UI_Task 内含I2C阻塞(约90ms), 刷新后再采一次, 补上阻塞期间漏掉的变化 */
     if (state == ST_RECORD) Rec_Sample(HAL_GetTick());
+    Rec_Heartbeat(HAL_GetTick());                 /* 蓝牙心跳(全状态), 验证TX链路 */
 #endif
 
     /* ---- 声音检测(启用时): PA15 活动电平持续 SND_HOLD_MS 才启动, 防误触发 ---- */
@@ -1167,6 +1188,7 @@ static void Main_Loop(void)
     case ST_RECORD: {                               /* 临时: 纯循迹 + 录制传感器数据 */
         uint32_t lap = now - t_state;
         uint8_t  evt = LineEvt_Task();
+        uint8_t  stop = 0;
 
         /* 丢线保护: 停车, 人工放回线上自动恢复 */
         if (lost_err) {
@@ -1175,17 +1197,12 @@ static void Main_Loop(void)
             break;
         }
 
-        /* 录满 → 停车并回传 */
-        if (rec_full) {
-            Motor_Stop();
-            Buzzer_Beep(P_DONE);
-            Rec_Dump();
-            Goto(ST_LAP1_DONE);
-            break;
-        }
+        /* 结束条件(任一): 录满 / 超时 / 压到终点横线(启动2.5s后) */
+        if (rec_full)                     stop = 1;
+        else if (lap >= REC_MAX_MS)       stop = 1;
+        else if (evt == 1 && lap > 2500)  stop = 1;
 
-        /* 终点/起点横线(启动2.5s后) → 结束录制并回传 */
-        if (evt == 1 && lap > 2500) {
+        if (stop) {
             Motor_Stop();
             rec_done = 1;
             Buzzer_Beep(P_DONE);
