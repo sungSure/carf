@@ -62,7 +62,8 @@
  * BT_ENABLE=1     : 蓝牙已接 USART3(PB10/PB11, 9600)                    */
 #define SOUND_ENABLE      1
 #define SOUND_ACTIVE      1        /* HW-484: 检测到声音DO输出高电平(实测资料) */
-#define SND_TEST_MS       6000u   /* 上电声音自检时长ms(显示DO电平+脉冲计数), 0=跳过 */
+#define SND_TEST_MS       0   /* 上电声音自检时长ms(显示DO电平+脉冲计数), 0=跳过 */
+#define SND_HOLD_MS       10u  /* 声音触发启动: 活动电平需持续时长ms(越小越灵敏, 太小易误触发) */
 #define AUTO_START_MS     3000u    /* 上电到自启延时ms, 0=禁用; 留时间摆车 */
 #define BT_ENABLE         1        /* 蓝牙模块已接入 */
 
@@ -790,7 +791,7 @@ static void Main_Loop(void)
     Radar_Task();
     UI_Task();
 
-    /* ---- 声音检测(启用时): PA15 活动电平持续30ms才启动, 防误触发 ---- */
+    /* ---- 声音检测(启用时): PA15 活动电平持续 SND_HOLD_MS 才启动, 防误触发 ---- */
 #if SOUND_ENABLE
     {
         static uint32_t t_snd = 0;
@@ -798,7 +799,7 @@ static void Main_Loop(void)
             snd_seen = now;                       /* 记录, 待命屏显示1s */
             if (state == ST_STANDBY) {
                 if (t_snd == 0) t_snd = now;
-                else if (now - t_snd >= 30) {
+                else if (now - t_snd >= SND_HOLD_MS) {
                     t_snd = 0;
                     Motor_Set(RUN20_PWM, RUN20_PWM);
                     Goto(ST_RUN20);
