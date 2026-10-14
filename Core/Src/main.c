@@ -71,9 +71,11 @@
 /* ---------- 调试开关 ---------- */
 #define TRACK_DBG         0        /* 1=调试模式: 延时后直接纯红外循迹, 跳过全部流程/
                                         雷达/避障/圈计时, OLED显示传感器状态; 调完改0 */
-#define REC_DBG           1        /* 1=录制模式(临时诊断): 声控启动后纯循迹, 记录传感器
+#define REC_DBG           0        /* 1=录制模式(临时诊断): 声控启动后纯循迹, 记录传感器
                                         变化沿, 到终点横线或录满后经蓝牙(USART3)回传文本;
                                         与 TRACK_DBG 互斥; 采完改0恢复验收流程 */
+#define EVT_LOG           1        /* 1=线事件(分叉/终点)出现即经蓝牙发 "#EVT ..." 打点,
+                                        便于手机串口核对触发时刻; 不需要时改0 */
 
 /* ---------- 数据录制(临时诊断) ---------- */
 #define REC_MAX           2000u    /* 最大记录条数(仅记变化沿), 每条3字节 ≈6KB RAM */
@@ -107,7 +109,7 @@
    且传感器多数时间(62%)读到全白(线常落在探头间隙), 所以阈值不能按"大黑块"取。 */
 #define LINE_MARK_MIN_MS    8u     /* 宽黑持续≥此值即判为横线(起点/终点), 实测仅~20ms */
 #define WIDE_MIN_CNT       3u      /* ≥此路同时压黑 视为"宽黑"(终点横线/路口), 1~2路为普通循迹 */
-#define FORK_MIN_MS        15u     /* 分叉图案持续此值 → Y路口(实测37ms, 取小值防漏判) */
+#define FORK_MIN_MS        10u     /* 分叉图案持续此值 → Y路口(实测仅37~48ms, 取更小值兜住采样盲区) */
 #define MIN_LAP_MS         6000u   /* 去程最早接受"终点"的时间(实测整圈约12.7s, 原15s会直接漏掉终点!) */
 #define MIN_RET_MS         1500u   /* 返程最早接受"起点"的时间 */
 #define RET_TURN_MS       900u     /* 终点原地掉头180°的旋转时长(现场标定: 掉头不准则调此值) */
@@ -130,7 +132,7 @@
 #define US_TIMEOUT_MS     30u      /* 单次测距超时(无回波=远) */
 
 /* ---------- OLED ---------- */
-#define UI_PERIOD_MS      250u     /* 屏幕刷新周期 */
+#define UI_PERIOD_MS      400u     /* 屏幕刷新周期(整帧I2C是阻塞盲区; 配合400kHz I2C把盲区压到<事件时长) */
 
 /* USER CODE END PD */
 
@@ -150,7 +152,9 @@ typedef enum {
     ST_WAIT5,         /* 停车计时5s */
     ST_LAP1,          /* 自动圈去程: 循迹+雷达+避障+Y路口选择 */
     ST_RETURN,        /* 终点掉头, 沿原路返回起点并停车 */
+#if REC_DBG
     ST_RECORD,        /* 临时: 纯循迹并录制传感器数据(诊断用) */
+#endif
     ST_LAP1_DONE,     /* 自动圈完成, 等M/B指令 */
     ST_MANUAL,        /* 手动遥控圈 */
     ST_FINISHED,      /* 全部完成, 显示数据 */
@@ -286,7 +290,6 @@ static void UI_Task(void);
 static void Main_Loop(void);
 #if REC_DBG
 static void Rec_Sample(uint32_t now);
-static void Rec_Send(const char *s);
 static void Rec_Dump(void);
 static void Rec_Reset(void);
 static void Rec_Heartbeat(uint32_t now);
@@ -904,6 +907,16 @@ static void UI_Task(void)
     OLED_ShowFrame();
 }
 
+/* ================= 蓝牙调试文本输出 =================
+ * 仅在"事件瞬间"调用(短串、阻塞发送) —— 把关键事件打点到手机串口。
+ * 注意: 一次短串发送约 40ms, 但只在事件发生的那一瞬调用, 不影响循迹。 */
+#if (BT_ENABLE || REC_DBG)
+static void Bt_Log(const char *s)
+{
+    HAL_UART_Transmit(&huart3, (uint8_t *)s, (uint16_t)strlen(s), 500);
+}
+#endif
+
 #if REC_DBG
 /* ================= 传感器录制(临时诊断) =================
  * 采样策略: 主循环每次迭代采样 g_ir, 仅当值与上条记录不同且距上条≥REC_MIN_GAP_MS
@@ -930,11 +943,6 @@ static void Rec_Sample(uint32_t now)
     rec_t[rec_n] = t; rec_v[rec_n] = g_ir; rec_n++;
 }
 
-static void Rec_Send(const char *s)
-{
-    HAL_UART_Transmit(&huart3, (uint8_t *)s, (uint16_t)strlen(s), 2000);
-}
-
 /* 周期心跳: 蓝牙应每 REC_HB_MS 收到一行 "#HB ..."
  *  收得到 → MCU→手机 TX 链路正常(问题在录制/触发)
  *  收不到 → TX 线(PB10↔模块RXD)/波特率/模块类型(SPP vs BLE)问题
@@ -946,7 +954,7 @@ static void Rec_Heartbeat(uint32_t now)
     char b[40];
     sprintf(b, "#HB st=%d ir=%X n=%u t=%lus\r\n", (int)state, (unsigned)g_ir,
             (unsigned)rec_n, (unsigned long)((now - t_state) / 1000));
-    Rec_Send(b);
+    Bt_Log(b);
 }
 
 /* 经蓝牙回传全部记录 */
@@ -956,15 +964,15 @@ static void Rec_Dump(void)
     sprintf(b, "\r\n#REC n=%u full=%u gap=%ums wait~%us\r\n", (unsigned)rec_n,
             (unsigned)rec_full, (unsigned)REC_MIN_GAP_MS,
             (unsigned)((unsigned)rec_n * 13u / 960u + 1u));
-    Rec_Send(b);
-    Rec_Send("t,L2L1R1R2\r\n");
+    Bt_Log(b);
+    Bt_Log("t,L2L1R1R2\r\n");
     for (uint16_t i = 0; i < rec_n; i++) {
         uint8_t v = rec_v[i];
         sprintf(b, "%u,%d%d%d%d\r\n", (unsigned)rec_t[i],
                 (v >> 3) & 1, (v >> 2) & 1, (v >> 1) & 1, v & 1);
-        Rec_Send(b);
+        Bt_Log(b);
     }
-    Rec_Send("#END\r\n");
+    Bt_Log("#END\r\n");
 }
 
 static void Rec_Reset(void)
@@ -1092,6 +1100,14 @@ static void Main_Loop(void)
 
         /* 线事件分类 */
         evt = LineEvt_Task();
+#if EVT_LOG && BT_ENABLE
+        if (evt) {                              /* 事件即打点: 手机串口可见触发时刻 */
+            char eb[40];
+            sprintf(eb, "#EVT t=%lums evt=%u ir=%u%u%u%u\r\n", (unsigned long)lap, (unsigned)evt,
+                    (g_ir >> 3) & 1, (g_ir >> 2) & 1, (g_ir >> 1) & 1, g_ir & 1);
+            Bt_Log(eb);
+        }
+#endif
 
         /* 前方避障触发(跑起来3s后才开始判, 避开起步误判) */
         if (evt != 2 && lap > 3000 && Front_Min() < AVOID_TRIGGER_CM) {
@@ -1208,7 +1224,7 @@ static void Main_Loop(void)
             char eb[40];
             sprintf(eb, "#EVT t=%lums evt=%u ir=%u%u%u%u\r\n", (unsigned long)lap, (unsigned)evt,
                     (g_ir >> 3) & 1, (g_ir >> 2) & 1, (g_ir >> 1) & 1, g_ir & 1);
-            Rec_Send(eb);
+            Bt_Log(eb);
         }
 
         /* 丢线保护: 停车, 人工放回线上自动恢复 */
@@ -1339,6 +1355,16 @@ int main(void)
   MX_TIM4_Init();
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
+
+  /* ---- I2C 提速到 400kHz(默认100kHz) ----
+   * 原因: 100kHz 下刷一帧 OLED(128x64≈1KB)要 ~100ms, 这期间主循环全阻塞,
+   *       等于每 UI_PERIOD_MS 出现一个 ~100ms 的"采样盲区"。
+   *       而实测分叉图案(1001)只持续 37~48ms、终点横线仅 ~20ms —— 
+   *       整个事件可能完全落在盲区里被漏掉(这次分叉漏判就与此有关)。
+   *       400kHz 把盲区压到 ~26ms < 事件时长, 事件不可能再被整段吞掉。
+   * 若屏幕出现花屏/不稳定, 说明你的 OLED 模块不支持 400kHz: 把下面两行注释掉即可回退。 */
+  hi2c1.Init.ClockSpeed = 400000;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK) Error_Handler();
 
   Buzzer_Set(0);                        /* 上电先关蜂鸣(gpio初始电平为响) */
   Motor_Stop();                         /* 电机归零 */
