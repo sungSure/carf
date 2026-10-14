@@ -90,7 +90,24 @@
 #define RUN20_PWM         130      /* 直行20cm的占空比 */
 #define RUN20_MS          1200u    /* 直行20cm的时长, 现场标定 */
 #define TURN90_MS         520u     /* 原地转约90°的时长 */
-#define Y_TURN_MS         550u     /* Y路口转向时长 */
+/* Y路口分支选择 = 传感器闭环的原地小半径旋转, 分四步:
+   [1] 原地旋转(外侧正转/内侧倒转 → 半径最小、弧线最短)
+   [2] 分支线扫到"所选侧的内侧探头" → 记一次"瞄准"(AIM)
+   [3] 瞄准后再多转 Y_AIM_MS 就停, 或超时/转过头 兜底  ← 角度由传感器决定, 不靠猜
+   [4] 转完先沿分支直行 ESCAPE_MS 驶离岔口区, 再交回循迹
+       (第4步是关键: 岔口处两条支线都在探头下, 粗分辨率的循迹会越纠越歪)
+   几何依据(实测 ir_log): 分叉瞬间 1001 = 左支线在 L2、右支线在 R2。
+   原地右转时视场整体左移 → 右支线 R2→R1→中→L1 扫过来; 左转相反。
+   故 选右 → 盯 R1(0x2); 选左 → 盯 L1(0x4)。 */
+#define Y_OUT             150      /* 旋转外侧轮速 */
+#define Y_IN              (-50)    /* 旋转内侧轮速(负=倒转 → 掉头式小半径) */
+#define Y_TURN_MIN_MS     150u     /* 最短旋转时间: 滤掉分叉瞬间的抖动 */
+#define Y_AIM_MS_DEF      0u       /* 瞄准(内侧探头压线)后再多转的时间; 默认0=一瞄准就停 */
+#define Y_TURN_MS_R       900u     /* 右分支旋转上限(超时兜底) */
+#define Y_TURN_MS_L       900u     /* 左分支旋转上限(左支发夹弯由循迹的 sharp_turn 接管) */
+#define Y_ESCAPE_MIN_MS   40u      /* 转完至少直行这么久驶离岔口 */
+#define Y_ESCAPE_MS       300u     /* 直行的上限(看到线就提前交回) */
+#define Y_SETTLE_WIN_MS   600u     /* 岔路后这么久内: 循迹丢线(全白)→直行, 不保持转角(防岔口甩过头) */
 #define AVOID_FWD_MS      750u     /* 避障侧移前进时长 */
 #define SPIN_PWM          150      /* 原地转占空比 */
 
@@ -112,7 +129,9 @@
 #define FORK_MIN_MS        10u     /* 分叉图案持续此值 → Y路口(实测仅37~48ms, 取更小值兜住采样盲区) */
 #define MIN_LAP_MS         6000u   /* 去程最早接受"终点"的时间(实测整圈约12.7s, 原15s会直接漏掉终点!) */
 #define MIN_RET_MS         1500u   /* 返程最早接受"起点"的时间 */
-#define RET_TURN_MS       900u     /* 终点原地掉头180°的旋转时长(现场标定: 掉头不准则调此值) */
+/* 原地旋转标定: PWM=150 时实测约 0.133°/ms (900ms≈120°, 差60°)。
+   180° → 900 × 180/120 = 1350ms。现场校法: 先设1000ms量一次实际转角θ, 再取 1000×180/θ。 */
+#define RET_TURN_MS       1350u    /* 终点原地掉头180°的旋转时长(蓝牙 T/F 可在线调) */
 #define RET_TURN_PWM      150      /* 掉头旋转轮速(左正右负, 原地转) */
 #define RET_ACQ_MS        2000u    /* 掉头后重新找线的时限; 超时则按丢线保护处理 */
 
@@ -174,7 +193,7 @@ typedef enum {
 } AvoidStep;
 
 /* Y路口子流程 */
-typedef enum { YS_IDLE, YS_TURN, YS_REACQ } YStep;
+typedef enum { YS_IDLE, YS_TURN, YS_ESCAPE } YStep;
 
 static CarState  state = ST_STANDBY;
 static uint32_t  t_state;            /* 进入当前状态的时刻 */
@@ -182,6 +201,13 @@ static uint32_t  lap1_ms = 0, lap2_ms = 0, rev_ms = 0;
 static float     speed_calib = 0;    /* 20cm标定速度 cm/s */
 
 static int16_t   base_speed = TRACK_BASE;
+
+/* ---- 现场标定值(掉电复位为上面的宏; 运行中可用蓝牙 T/F/Y/H 在线微调) ---- */
+static uint16_t  ret_turn_ms = RET_TURN_MS;      /* 终点掉头旋转时长 */
+static uint16_t  y_aim_ms    = Y_AIM_MS_DEF;     /* Y路口: 瞄准后再多转的时间 */
+static uint16_t  y_turn_r_ms = Y_TURN_MS_R;      /* Y路口右分支旋转上限 */
+static uint16_t  y_turn_l_ms = Y_TURN_MS_L;      /* Y路口左分支旋转上限 */
+
 static uint8_t   y_choice_left = 1;  /* Y路口: 1=左 0=右 */
 static uint8_t   y_fired = 0;        /* 本圈Y是否已处理 */
 static uint8_t   lost_err = 0;       /* 丢线保护触发标志 */
@@ -226,6 +252,8 @@ static uint32_t   av_t;
 static float      av_dl, av_dr;
 static YStep      ys = YS_IDLE;
 static uint32_t   ys_t;
+static uint32_t   y_aim_t;           /* 本轮岔路"瞄准到分支线"的时刻, 0=还没瞄准 */
+static uint32_t   fork_settle_until; /* 岔路后 Y_SETTLE_WIN_MS 内: 循迹丢线直行(不保持转角) */
 
 /* ---------- 超声波 ---------- */
 static volatile uint8_t  us_done = 0;
@@ -286,6 +314,10 @@ static void Track_Drive(uint8_t reverse);
 static void Avoid_Task(void);
 static void Y_Task(void);
 static void BT_Process(uint8_t c);
+static void Cal_Log(void);
+#if (BT_ENABLE || REC_DBG)
+static void Bt_Log(const char *s);
+#endif
 static void UI_Task(void);
 static void Main_Loop(void);
 #if REC_DBG
@@ -304,6 +336,8 @@ static void Goto(CarState s)
 {
     state  = s;
     t_state = HAL_GetTick();
+    ys = YS_IDLE;                    /* 切状态时清掉 Y 子流程, 防"带偏"进新状态 */
+    y_aim_t = 0;
 }
 
 /* ================= 电机: 统一符号接口 ================= */
@@ -534,18 +568,24 @@ static void Track_Drive(uint8_t reverse)
     if (IR_Wide(g_ir)) {           /* 宽黑(横线/路口): 事件机负责判定, 车直行通过 */
         diff = 0;
     } else if (g_ir == 0) {        /* 全白: 先保持原曲率滑过间隙, 持续过久才强打方向找线 */
-        if (t_gap == 0) t_gap = HAL_GetTick();
-        if (last_err >= 2) {       /* 外侧压线后线消失 → U型急弯, 切旋转 */
+        uint32_t now_g = HAL_GetTick();
+        if (t_gap == 0) t_gap = now_g;
+        if (last_err >= 2) {   /* 外侧压线后线消失 → U型急弯, 切旋转 */
             sharp_turn = +1;
             return;
         } else if (last_err <= -2) {
             sharp_turn = -1;
             return;
         }
-        if (HAL_GetTick() - t_gap <= GAP_HOLD_MS)
+        /* 岔路后短暂窗口内: 丢线就直行(不再"保持上一次转角"甩过头);
+           发夹弯的急转由上面的 sharp_turn 兜, 不受影响 */
+        if (now_g < fork_settle_until) {
+            diff = 0;
+        } else if (now_g - t_gap <= GAP_HOLD_MS) {
             diff = TRACK_K * last_err;                       /* 间隙: 维持当前转向 */
-        else
+        } else {
             diff = (last_err >= 0) ? TRACK_DIFF_MAX : -TRACK_DIFF_MAX;   /* 真丢线: 满差速 */
+        }
     } else {
         int8_t e = 0;
         if (g_ir & 0x8) e -= 3;
@@ -659,17 +699,72 @@ static void Y_Task(void)
     switch (ys) {
     case YS_IDLE:
         return;
-    case YS_TURN:                                   /* 向选定分支差速转向 */
-        if (now - ys_t >= Y_TURN_MS) {
-            Motor_Set(base_speed * 7 / 10, base_speed * 7 / 10);
-            ys = YS_REACQ; ys_t = now;
+    case YS_TURN: {                                 /* 原地小半径旋转抢分支(传感器闭环) */
+        uint32_t dt  = now - ys_t;
+        uint16_t cap = y_choice_left ? y_turn_l_ms : y_turn_r_ms;
+        uint8_t  wide = IR_Wide(g_ir);
+        /* 所选侧的内侧探头 = 分支线扫过来的必经点(选右盯 R1, 选左盯 L1) */
+        uint8_t  aim = (uint8_t)(y_choice_left ? (g_ir & 0x4) : (g_ir & 0x2));
+        const char *why = 0;
+
+        /* 外侧轮正转 / 内侧轮倒转: 转弯半径最小, 走的弧线最短 */
+        if (y_choice_left) Motor_Set(Y_IN,  Y_OUT);
+        else               Motor_Set(Y_OUT, Y_IN);
+
+        if (dt < Y_TURN_MIN_MS) break;              /* 抖动期不判, 只转 */
+
+        if (aim && !wide && y_aim_t == 0) {         /* [2] 首次瞄准到分支线 */
+            y_aim_t = now;
+#if (BT_ENABLE || REC_DBG)
+            {   char b[44];
+                sprintf(b, "#Y AIM dt=%ums ir=%u%u%u%u\r\n", (unsigned)dt,
+                        (g_ir >> 3) & 1, (g_ir >> 2) & 1, (g_ir >> 1) & 1, g_ir & 1);
+                Bt_Log(b); }
+#endif
+        }
+
+        /* 结束: 瞄准后再多转够(y_aim_ms, 默认0) / 超时兜底 */
+        if      (y_aim_t && now - y_aim_t >= y_aim_ms) why = "AIM";
+        else if (dt >= cap)                            why = "TMO";
+
+        if (why) {
+#if (BT_ENABLE || REC_DBG)
+            char b[48];
+            sprintf(b, "#Y %s dt=%ums aim=%ums ir=%u%u%u%u\r\n", why, (unsigned)dt,
+                    (unsigned)(y_aim_t ? (y_aim_t - ys_t) : 0u),
+                    (g_ir >> 3) & 1, (g_ir >> 2) & 1, (g_ir >> 1) & 1, g_ir & 1);
+            Bt_Log(b);
+#endif
+            last_err = 0; t_lost = 0;               /* 清掉岔口前/旋转中的偏差记忆 */
+            fork_settle_until = now + Y_SETTLE_WIN_MS;  /* 后续窗口内循迹丢线→直行, 防甩过头 */
+            ys = YS_ESCAPE; ys_t = now;
         }
         break;
-    case YS_REACQ:                                  /* 低速找回分支线 */
-        if (g_ir != 0 && g_ir != 0x0F) { ys = YS_IDLE; }
-        else if (now - ys_t >= REACQ_MS)  { ys = YS_IDLE; }
+    }
+    case YS_ESCAPE:                                 /* 沿分支直行驶离岔口 */
+        /* 关键: 偏差已清 0 → 循迹在"探头间隙(全白)"里会直行而不是保持刚才的转角,
+           这才是不在岔口越纠越歪、右支不再转过头的原因 */
+        Motor_Set(base_speed * 7 / 10, base_speed * 7 / 10);
+        if (now - ys_t >= Y_ESCAPE_MIN_MS) {
+            if ((g_ir != 0 && !IR_Wide(g_ir)) || now - ys_t >= Y_ESCAPE_MS) {
+                LineEvt_Reset();
+                ys = YS_IDLE;                       /* 交回普通循迹 */
+            }
+        }
         break;
     }
+}
+
+/* ================= 现场标定参数回传 ================= */
+static void Cal_Log(void)
+{
+#if (BT_ENABLE || REC_DBG)
+    char b[56];
+    sprintf(b, "#CAL turn=%ums aim=%ums L=%ums R=%ums\r\n",
+            (unsigned)ret_turn_ms, (unsigned)y_aim_ms,
+            (unsigned)y_turn_l_ms, (unsigned)y_turn_r_ms);
+    Bt_Log(b);
+#endif
 }
 
 /* ================= 蓝牙指令处理 ================= */
@@ -687,6 +782,12 @@ static void BT_Process(uint8_t c)
         break;
     case 'L': y_choice_left = 1; break;             /* Y路口选左 */
     case 'R': y_choice_left = 0; break;             /* Y路口选右 */
+
+    /* --- 现场标定(掉电恢复为宏定义值; 每按一次回一条 #CAL) --- */
+    case 'T': ret_turn_ms += 100; if (ret_turn_ms > 4000) ret_turn_ms = 4000; Cal_Log(); break;
+    case 'F': if (ret_turn_ms > 200) ret_turn_ms -= 100; else ret_turn_ms = 200; Cal_Log(); break;
+    case 'Y': y_aim_ms += 20;    if (y_aim_ms > 400) y_aim_ms = 400; Cal_Log(); break;
+    case 'H': if (y_aim_ms >= 20) y_aim_ms -= 20; else y_aim_ms = 0; Cal_Log(); break;
 
     /* --- 启动 --- */
     case 'G':
@@ -744,6 +845,8 @@ static void UI_Task(void)
 #if REC_DBG
     if (state == ST_RECORD) period = 1000u;   /* 录制时降低刷屏频率, 缩小I2C阻塞盲区 */
 #endif
+    /* 岔路旋转期间不刷屏: 一帧I2C~26ms是采样盲区, 会让"瞄准到分支线"的窗口被整段吞掉 */
+    if (ys != YS_IDLE) return;
     if (now - ui_t < period) return;
     ui_t = now;
     if (!ui_init) return;
@@ -1120,9 +1223,8 @@ static void Main_Loop(void)
         /* Y路口(分叉): 本圈未处理过 */
         if (evt == 2 && lap > 1500 && !y_fired) {
             y_fired = 1;
-            if (y_choice_left) Motor_Set(base_speed / 4, base_speed);       /* 左分支 */
-            else               Motor_Set(base_speed, base_speed / 4);       /* 右分支 */
-            ys = YS_TURN; ys_t = now;
+            ys = YS_TURN; ys_t = now; y_aim_t = 0;   /* 岔路旋转交给 Y_Task(传感器闭环) */
+            Y_Task();                                /* 当拍就生效, 不留空转 */
             break;
         }
 
@@ -1169,7 +1271,7 @@ static void Main_Loop(void)
         switch (rt) {
         case RT_TURN:                               /* 原地掉头180° */
             Motor_Set(RET_TURN_PWM, -RET_TURN_PWM);
-            if (now - rt_t >= RET_TURN_MS) {
+            if (now - rt_t >= ret_turn_ms) {
                 Motor_Stop();
                 LineEvt_Reset();                    /* 清掉停在终点线上产生的黑事件 */
                 t_lost = 0;
