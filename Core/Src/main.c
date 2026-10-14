@@ -8,7 +8,7 @@
   *
   * 流程: 待命 → 启动(PA15声音) → 直行20cm → 停车计时5s → 蜂鸣
   *       → 去程循迹(雷达扫描+点云图+Y路口分叉识别+避障) → 到终点横线停车
-  *       → 原地掉头 → 沿原路返回起点横线停车(记去程/返程/总时)
+  *       → 倒车沿原路返回起点横线停车(记去程/返程/总时)
   *       → 第2圈手动遥控(蓝牙) → 数据显示 → (拓展)逆向循迹返程
   *
   * 架构: 主循环无阻塞, 全部基于 HAL_GetTick() 时间片调度
@@ -129,11 +129,10 @@
 #define FORK_MIN_MS        10u     /* 分叉图案持续此值 → Y路口(实测仅37~48ms, 取更小值兜住采样盲区) */
 #define MIN_LAP_MS         6000u   /* 去程最早接受"终点"的时间(实测整圈约12.7s, 原15s会直接漏掉终点!) */
 #define MIN_RET_MS         1500u   /* 返程最早接受"起点"的时间 */
-/* 原地旋转标定: PWM=150 时实测约 0.133°/ms (900ms≈120°, 差60°)。
-   180° → 900 × 180/120 = 1350ms。现场校法: 先设1000ms量一次实际转角θ, 再取 1000×180/θ。 */
-#define RET_TURN_MS       1350u    /* 终点原地掉头180°的旋转时长(蓝牙 T/F 可在线调) */
-#define RET_TURN_PWM      150      /* 掉头旋转轮速(左正右负, 原地转) */
-#define RET_ACQ_MS        2000u    /* 掉头后重新找线的时限; 超时则按丢线保护处理 */
+/* 倒车循迹: 两轮反转沿原路倒退回起点。倒车时车头朝向不变, 红外探头仍朝前,
+   循迹偏差 e 含义不变; 但行进方向反了 → 修正的左右轮速分配要反过来,
+   在 Track_Drive(reverse) 里做"左右互换并取反"。倒车速度略低于前进更稳。 */
+#define RET_BASE          90       /* 倒车基础占空比(蓝牙 T/F 在线调) */
 
 /* ---------- 避障 ---------- */
 #define AVOID_TRIGGER_CM  40.0f    /* 前方距离阈值(含雷达刷新延迟余量) */
@@ -203,7 +202,7 @@ static float     speed_calib = 0;    /* 20cm标定速度 cm/s */
 static int16_t   base_speed = TRACK_BASE;
 
 /* ---- 现场标定值(掉电复位为上面的宏; 运行中可用蓝牙 T/F/Y/H 在线微调) ---- */
-static uint16_t  ret_turn_ms = RET_TURN_MS;      /* 终点掉头旋转时长 */
+static int16_t   ret_base = RET_BASE;           /* 倒车基础速度(蓝牙 T/F 在线调) */
 static uint16_t  y_aim_ms    = Y_AIM_MS_DEF;     /* Y路口: 瞄准后再多转的时间 */
 static uint16_t  y_turn_r_ms = Y_TURN_MS_R;      /* Y路口右分支旋转上限 */
 static uint16_t  y_turn_l_ms = Y_TURN_MS_L;      /* Y路口左分支旋转上限 */
@@ -228,8 +227,8 @@ static struct {
 } le;
 
 /* 回到起点子流程 */
-typedef enum { RT_TURN, RT_REACQ, RT_TRACK } RetStep;
-static RetStep   rt = RT_TURN;
+typedef enum { RT_TRACK } RetStep;               /* 倒车返程: 单步循迹, 不再掉头 */
+static RetStep   rt = RT_TRACK;
 static uint32_t  rt_t;               /* 当前返回子步骤起始时刻 */
 static uint32_t  out_ms = 0;         /* 去程用时(起点→终点) */
 static uint32_t  back_ms = 0;        /* 返程用时(终点→起点) */
@@ -570,12 +569,14 @@ static void Track_Drive(uint8_t reverse)
     } else if (g_ir == 0) {        /* 全白: 先保持原曲率滑过间隙, 持续过久才强打方向找线 */
         uint32_t now_g = HAL_GetTick();
         if (t_gap == 0) t_gap = now_g;
-        if (last_err >= 2) {   /* 外侧压线后线消失 → U型急弯, 切旋转 */
-            sharp_turn = +1;
-            return;
-        } else if (last_err <= -2) {
-            sharp_turn = -1;
-            return;
+        if (!reverse) {             /* 倒车时不触发原地旋转(方向相反易乱), 只靠差速纠正 */
+            if (last_err >= 2) {   /* 外侧压线后线消失 → U型急弯, 切旋转 */
+                sharp_turn = +1;
+                return;
+            } else if (last_err <= -2) {
+                sharp_turn = -1;
+                return;
+            }
         }
         /* 岔路后短暂窗口内: 丢线就直行(不再"保持上一次转角"甩过头);
            发夹弯的急转由上面的 sharp_turn 兜, 不受影响 */
@@ -606,11 +607,14 @@ static void Track_Drive(uint8_t reverse)
     if (diff >  TRACK_DIFF_MAX) diff =  TRACK_DIFF_MAX;
     if (diff < -TRACK_DIFF_MAX) diff = -TRACK_DIFF_MAX;
 
-    l = base_speed + diff;
-    r = base_speed - diff;
+    int16_t spd = reverse ? ret_base : base_speed;
+    l = spd + diff;
+    r = spd - diff;
 
-    /* 倒车循迹: 转向物理方向随行进方向反转, 公式取负即可 */
-    if (reverse) { l = -l; r = -r; }
+    /* 倒车循迹: 行进方向反了 → 同样的偏差, 修正的左右轮速分配要反过来。
+       前进 l=spd+diff / r=spd-diff; 倒车取 l=-(spd-diff) / r=-(spd+diff)
+       (= 前进左右互换再取反) → 车体朝相反方向修正, 才能贴住原路倒退 */
+    if (reverse) { l = -(spd - diff); r = -(spd + diff); }
     Motor_Set(l, r);
 }
 
@@ -760,8 +764,8 @@ static void Cal_Log(void)
 {
 #if (BT_ENABLE || REC_DBG)
     char b[56];
-    sprintf(b, "#CAL turn=%ums aim=%ums L=%ums R=%ums\r\n",
-            (unsigned)ret_turn_ms, (unsigned)y_aim_ms,
+    sprintf(b, "#CAL ret=%d aim=%ums L=%ums R=%ums\r\n",
+            (int)ret_base, (unsigned)y_aim_ms,
             (unsigned)y_turn_l_ms, (unsigned)y_turn_r_ms);
     Bt_Log(b);
 #endif
@@ -784,8 +788,8 @@ static void BT_Process(uint8_t c)
     case 'R': y_choice_left = 0; break;             /* Y路口选右 */
 
     /* --- 现场标定(掉电恢复为宏定义值; 每按一次回一条 #CAL) --- */
-    case 'T': ret_turn_ms += 100; if (ret_turn_ms > 4000) ret_turn_ms = 4000; Cal_Log(); break;
-    case 'F': if (ret_turn_ms > 200) ret_turn_ms -= 100; else ret_turn_ms = 200; Cal_Log(); break;
+    case 'T': ret_base += 10; if (ret_base > PWM_MAX) ret_base = PWM_MAX; Cal_Log(); break;
+    case 'F': if (ret_base > 40) ret_base -= 10; else ret_base = 40; Cal_Log(); break;
     case 'Y': y_aim_ms += 20;    if (y_aim_ms > 400) y_aim_ms = 400; Cal_Log(); break;
     case 'H': if (y_aim_ms >= 20) y_aim_ms -= 20; else y_aim_ms = 0; Cal_Log(); break;
 
@@ -936,7 +940,7 @@ static void UI_Task(void)
         sprintf(buf, "T: %lu.%01lus", (unsigned long)((now - t_state) / 1000),
                 (unsigned long)(((now - t_state) / 100) % 10));
         OLED_PrintASCIIString(10, 32, buf, &afont12x6, OLED_COLOR_NORMAL);
-        OLED_PrintASCIIString(10, 50, rt == RT_TURN ? "TURN AROUND" : "BACK TO START", &afont8x6, OLED_COLOR_NORMAL);
+        OLED_PrintASCIIString(10, 50, "REVERSE TO START", &afont8x6, OLED_COLOR_NORMAL);
         break;
 
 #if REC_DBG
@@ -1228,15 +1232,17 @@ static void Main_Loop(void)
             break;
         }
 
-        /* 终点横线: 停车记时 → 掉头返回起点 */
+        /* 终点横线: 停车记时 → 倒车返回起点 */
         if (evt == 1 && lap > MIN_LAP_MS) {
             Motor_Stop();
             Radar_Disable();
             out_ms   = lap;                         /* 去程用时 */
             lost_err = 0;
             t_lost   = 0;
-            rt       = RT_TURN;
+            sharp_turn = 0;                         /* 清掉去程遗留的急弯状态 */
+            rt       = RT_TRACK;                    /* 不再掉头, 直接倒车循迹返程 */
             rt_t     = now;
+            LineEvt_Reset();                        /* 清掉压在终点横线上的事件状态 */
             Buzzer_Beep(P_LAP);
             Goto(ST_RETURN);
             break;
@@ -1258,7 +1264,7 @@ static void Main_Loop(void)
         break;
     }
 
-    case ST_RETURN: {                               /* 终点掉头 → 沿原路返回起点 */
+    case ST_RETURN: {                               /* 倒车沿原路返回起点 */
         uint8_t  evt;
 
         /* 丢线保护触发后停车, 人工把车放回线上自动恢复 */
@@ -1269,33 +1275,12 @@ static void Main_Loop(void)
         }
 
         switch (rt) {
-        case RT_TURN:                               /* 原地掉头180° */
-            Motor_Set(RET_TURN_PWM, -RET_TURN_PWM);
-            if (now - rt_t >= ret_turn_ms) {
-                Motor_Stop();
-                LineEvt_Reset();                    /* 清掉停在终点线上产生的黑事件 */
-                t_lost = 0;
-                rt = RT_REACQ; rt_t = now;
-            }
-            break;
-
-        case RT_REACQ:                              /* 前进离开终点线, 直到重新压到循迹线 */
-            Motor_Set(TRACK_BASE / 2, TRACK_BASE / 2);
-            if (g_ir != 0 && g_ir != 0x0F) {        /* 重新看到单条黑线 → 接管循迹 */
-                rt = RT_TRACK; rt_t = now; t_lost = 0;
-            } else if (now - rt_t > RET_ACQ_MS) {   /* 时限内找不到线 → 交丢线保护 */
-                Motor_Stop();
-                lost_err = 1;
-                Buzzer_Beep(P_ERR);
-            }
-            break;
-
         default:
-        case RT_TRACK:                              /* 正常循迹返回, 检测起点横线 */
+        case RT_TRACK:                              /* 倒车循迹返回起点, 检测起点横线 */
             evt = LineEvt_Task();
             if (evt == 1 && now - rt_t > MIN_RET_MS) {
                 Motor_Stop();
-                back_ms = now - t_state;            /* 返程用时(含掉头) */
+                back_ms = now - t_state;            /* 返程用时(倒车) */
                 lap1_ms = out_ms + back_ms;         /* 自动圈总时 */
                 Buzzer_Beep(P_DONE);
                 Goto(ST_LAP1_DONE);
@@ -1309,7 +1294,7 @@ static void Main_Loop(void)
                     break;
                 }
             } else t_lost = 0;
-            Track_Drive(0);
+            Track_Drive(1);                         /* 倒车反向循迹 */
             break;
         }
         break;
