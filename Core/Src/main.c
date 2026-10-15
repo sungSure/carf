@@ -50,9 +50,10 @@
  * 蓝牙: USART3 PB10/11 9600(EN/STATE悬空不接)
  * 声音: HW-484 DO→PA15, 有声音输出高电平
  * ============ 蓝牙指令表(单字符) ============ *
- *  G: 启动(声音关闭时的启动信号)   L/R: Y路口选左/右(默认左)
+ *  G: 启动(声音关闭时的启动信号) / 手动圈中恢复终点检测
+ *  L/R: Y路口选左/右(默认左)
  *  M: 自动圈结束后进入手动圈       B: 完成后触发逆向返程(拓展)
- *  W/A/S/D/X: 手动圈 遥控 前/左/后/右/停
+ *  W/A/S/D/X: 手动圈 遥控 前/左/后/右/停(松手即停, 手动圈默认不检测终点)
  *  U/J: 循迹基础速度 ±10(现场免重烧调参)
  * ==================================== */
 
@@ -210,6 +211,8 @@ static int16_t   base_speed = TRACK_BASE;
 
 /* 手动遥控: 最近一次收到运动指令的时刻(0=已停); 超时停车用, 实现"松手即停" */
 static uint32_t  man_last_cmd = 0;
+/* 手动圈终点检测使能: 0=不检测(直角弯会被误判成终点), 蓝牙发'G'后置1恢复检测 */
+static uint8_t   man_end_armed = 0;
 
 /* ---- 现场标定值(掉电复位为上面的宏; 运行中可用蓝牙 T/F/Y/H 在线微调) ---- */
 static int16_t   ret_base = RET_BASE;           /* 倒车基础速度(蓝牙 T/F 在线调) */
@@ -808,6 +811,9 @@ static void BT_Process(uint8_t c)
         if (state == ST_STANDBY) {
             Motor_Set(RUN20_PWM, RUN20_PWM);
             Goto(ST_RUN20);
+        } else if (state == ST_MANUAL) {
+            man_end_armed = 1;                      /* 恢复终点检测 */
+            LineEvt_Reset();                        /* 清线事件状态, 从当前帧重新跟踪 */
         }
         break;
 
@@ -816,6 +822,7 @@ static void BT_Process(uint8_t c)
         if (state == ST_LAP1_DONE) {
             LineEvt_Reset();
             man_last_cmd = 0;                       /* 进手动圈前清遥控时间戳 */
+            man_end_armed = 0;                      /* 默认不检测终点(防直角弯误判) */
             Goto(ST_MANUAL);
         }
         break;
@@ -990,7 +997,8 @@ static void UI_Task(void)
         sprintf(buf, "T: %lu.%01lus", (unsigned long)((now - t_state) / 1000),
                 (unsigned long)(((now - t_state) / 100) % 10));
         OLED_PrintASCIIString(10, 24, buf, &afont12x6, OLED_COLOR_NORMAL);
-        OLED_PrintASCIIString(4, 44, "W/A/S/D/X drive", &afont8x6, OLED_COLOR_NORMAL);
+        OLED_PrintASCIIString(4, 40, "W/A/S/D/X drive", &afont8x6, OLED_COLOR_NORMAL);
+        OLED_PrintASCIIString(4, 50, man_end_armed ? "G: end armed" : "G: detect end", &afont8x6, OLED_COLOR_NORMAL);
         break;
 
     case ST_FINISHED: {
@@ -1374,7 +1382,9 @@ static void Main_Loop(void)
             Motor_Stop();
             man_last_cmd = 0;
         }
-        if ((evt == 1 || evt == 2) && lap > MIN_LAP_MS) {
+        /* 只有发'G'恢复检测(man_end_armed)后, 线事件才当终点;
+           否则遥控途中经过直角弯会被误判成终点 */
+        if (man_end_armed && (evt == 1 || evt == 2) && lap > MIN_LAP_MS) {
             Motor_Stop();
             lap2_ms = lap;
             Buzzer_Beep(P_DONE);
