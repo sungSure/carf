@@ -65,7 +65,8 @@
 #define SOUND_ACTIVE      1        /* HW-484: 检测到声音DO输出高电平(实测资料) */
 #define SND_TEST_MS       0   /* 上电声音自检时长ms(显示DO电平+脉冲计数), 0=跳过 */
 #define SND_HOLD_MS       1u  /* 声音触发启动: 活动电平需持续时长ms(越小越灵敏, 太小易误触发) */
-#define AUTO_START_MS     3000u    /* 上电到自启延时ms, 0=禁用; 留时间摆车 */
+#define POWERON_QUIET_MS  3000u    /* 上电静默期: 期间不响应声音(防上电毛刺/话筒高灵敏误触发 + 留时间摆车), 之后才进入等待信号 */
+#define AUTO_START_MS     3000u    /* 上电到自启延时ms(仅 SOUND_ENABLE=0 时生效), 0=禁用 */
 #define BT_ENABLE         1        /* 蓝牙模块已接入 */
 
 /* ---------- 调试开关 ---------- */
@@ -862,12 +863,20 @@ static void UI_Task(void)
     case ST_STANDBY: {
         OLED_PrintASCIIString(16, 0, "== CAR READY ==", &afont12x6, OLED_COLOR_NORMAL);
 #if SOUND_ENABLE
-        OLED_PrintASCIIString(16, 16, "WAIT SOUND ...", &afont12x6, OLED_COLOR_NORMAL);
-        /* 声音触发可视化: 拍手后显示ACTIVE!持续1s, 用于验证极性/灵敏度 */
-        if (snd_seen != 0 && now - snd_seen < 1000)
-            OLED_PrintASCIIString(22, 30, "SND: ACTIVE !", &afont12x6, OLED_COLOR_NORMAL);
-        else
+        if ((now - t_state) < POWERON_QUIET_MS) {
+            /* 上电静默期: 显示倒计时, 期间不响应声音(防上电毛刺误触发) */
+            uint32_t left = (POWERON_QUIET_MS - (now - t_state) + 999u) / 1000u;
+            sprintf(buf, "ARMING.. %us", (unsigned)left);
+            OLED_PrintASCIIString(16, 16, buf, &afont12x6, OLED_COLOR_NORMAL);
             OLED_PrintASCIIString(28, 30, "SND: ----", &afont12x6, OLED_COLOR_NORMAL);
+        } else {
+            OLED_PrintASCIIString(16, 16, "WAIT SOUND ...", &afont12x6, OLED_COLOR_NORMAL);
+            /* 声音触发可视化: 拍手后显示ACTIVE!持续1s, 用于验证极性/灵敏度 */
+            if (snd_seen != 0 && now - snd_seen < 1000)
+                OLED_PrintASCIIString(22, 30, "SND: ACTIVE !", &afont12x6, OLED_COLOR_NORMAL);
+            else
+                OLED_PrintASCIIString(28, 30, "SND: ----", &afont12x6, OLED_COLOR_NORMAL);
+        }
 #elif AUTO_START_MS > 0
         uint32_t left_ms = (now - t_state >= AUTO_START_MS) ? 0
                                                        : (AUTO_START_MS - (now - t_state));
@@ -960,14 +969,10 @@ static void UI_Task(void)
 
     case ST_LAP1_DONE:
         OLED_PrintASCIIString(24, 0, "LAP1 DONE", &afont16x8, OLED_COLOR_NORMAL);
-        sprintf(buf, "OUT: %lu.%01lus", (unsigned long)(out_ms / 1000), (unsigned long)((out_ms / 100) % 10));
+        sprintf(buf, "LAP: %lu.%01lus", (unsigned long)(out_ms / 1000), (unsigned long)((out_ms / 100) % 10));
         OLED_PrintASCIIString(10, 18, buf, &afont12x6, OLED_COLOR_NORMAL);
-        sprintf(buf, "RET: %lu.%01lus", (unsigned long)(back_ms / 1000), (unsigned long)((back_ms / 100) % 10));
-        OLED_PrintASCIIString(10, 30, buf, &afont12x6, OLED_COLOR_NORMAL);
-        sprintf(buf, "TOT: %lu.%01lus", (unsigned long)((out_ms + back_ms) / 1000),
-                (unsigned long)(((out_ms + back_ms) / 100) % 10));
-        OLED_PrintASCIIString(10, 42, buf, &afont12x6, OLED_COLOR_NORMAL);
-        OLED_PrintASCIIString(4, 54, "BT 'M':man 'B':rev", &afont8x6, OLED_COLOR_NORMAL);
+        OLED_PrintASCIIString(10, 34, "PUT BACK TO START", &afont8x6, OLED_COLOR_NORMAL);
+        OLED_PrintASCIIString(4, 54, "BT 'M': manual lap", &afont8x6, OLED_COLOR_NORMAL);
         break;
 
     case ST_MANUAL:
@@ -1114,7 +1119,7 @@ static void Main_Loop(void)
         static uint32_t t_snd = 0;
         if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_15) == (GPIO_PinState)SOUND_ACTIVE) {
             snd_seen = now;                       /* 记录, 待命屏显示1s */
-            if (state == ST_STANDBY) {
+            if (state == ST_STANDBY && (now - t_state) >= POWERON_QUIET_MS) {
                 if (t_snd == 0) t_snd = now;
                 else if (now - t_snd >= SND_HOLD_MS) {
                     t_snd = 0;
@@ -1232,19 +1237,17 @@ static void Main_Loop(void)
             break;
         }
 
-        /* 终点横线: 停车记时 → 倒车返回起点 */
+        /* 终点横线: 停车记时 → 一圈结束(暂时放弃倒车, 人工放回起点) */
         if (evt == 1 && lap > MIN_LAP_MS) {
             Motor_Stop();
             Radar_Disable();
             out_ms   = lap;                         /* 去程用时 */
+            lap1_ms  = lap;                         /* 自动圈总时 = 去程(不再倒车) */
             lost_err = 0;
             t_lost   = 0;
-            sharp_turn = 0;                         /* 清掉去程遗留的急弯状态 */
-            rt       = RT_TRACK;                    /* 不再掉头, 直接倒车循迹返程 */
-            rt_t     = now;
             LineEvt_Reset();                        /* 清掉压在终点横线上的事件状态 */
             Buzzer_Beep(P_LAP);
-            Goto(ST_RETURN);
+            Goto(ST_LAP1_DONE);                     /* 停车等人工放回, 不再自动倒车 */
             break;
         }
 
