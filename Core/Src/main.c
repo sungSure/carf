@@ -54,6 +54,7 @@
  *  L/R: Y路口选左/右(默认左)
  *  M: 自动圈结束后进入手动圈       B: 完成后触发逆向返程(拓展)
  *  W/A/S/D/X: 手动圈 遥控 前/左/后/右/停(松手即停, 手动圈默认不检测终点)
+ *  P: 手动圈 助推(前进满油门冲一下, 越过不平整路面起步; 松手即停)
  *  U/J: 循迹基础速度 ±10(现场免重烧调参)
  * ==================================== */
 
@@ -116,6 +117,7 @@
 /* ---------- 手动遥控(蓝牙) ---------- */
 #define MAN_SPEED         70       /* 手动遥控直行/后退占空比(慢速易控) */
 #define MAN_SPIN          90       /* 手动遥控原地转占空比(慢速) */
+#define MAN_BOOST         199      /* 手动遥控助推占空比(满速: 赛道不平整起步动不起来时冲一下) */
 #define MAN_HOLD_MS       400u     /* 手动遥控指令保持: 超过此ms无新指令即停车(松手即停);
                                      须大于 App 按住循环发送的间隔(建议 App 间隔 100~200ms) */
 
@@ -841,10 +843,11 @@ static void BT_Process(uint8_t c)
     case 'A': if (state == ST_MANUAL) { Motor_Set(-MAN_SPIN,   MAN_SPIN);  man_last_cmd = HAL_GetTick(); } break;
     case 'D': if (state == ST_MANUAL) { Motor_Set( MAN_SPIN,  -MAN_SPIN);  man_last_cmd = HAL_GetTick(); } break;
     case 'X': if (state == ST_MANUAL) { Motor_Stop(); man_last_cmd = 0; }                  break;
+    case 'P': if (state == ST_MANUAL) { Motor_Set( MAN_BOOST,  MAN_BOOST); man_last_cmd = HAL_GetTick(); } break;  /* 助推 */
 
 #if REC_DBG
     /* --- 录制模式控制 --- */
-    case 'P':                                       /* 立即回传已录数据 */
+    case 'O':                                       /* 立即回传已录数据('P'已让给手动助推) */
         Motor_Stop();
         Rec_Dump();
         break;
@@ -999,6 +1002,7 @@ static void UI_Task(void)
         OLED_PrintASCIIString(10, 24, buf, &afont12x6, OLED_COLOR_NORMAL);
         OLED_PrintASCIIString(4, 40, "W/A/S/D/X drive", &afont8x6, OLED_COLOR_NORMAL);
         OLED_PrintASCIIString(4, 50, man_end_armed ? "G: end armed" : "G: detect end", &afont8x6, OLED_COLOR_NORMAL);
+        OLED_PrintASCIIString(4, 58, "P: boost", &afont8x6, OLED_COLOR_NORMAL);
         break;
 
     case ST_FINISHED: {
