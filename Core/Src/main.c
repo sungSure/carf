@@ -110,7 +110,13 @@
 #define Y_ESCAPE_MS       300u     /* 直行的上限(看到线就提前交回) */
 #define Y_SETTLE_WIN_MS   600u     /* 岔路后这么久内: 循迹丢线(全白)→直行, 不保持转角(防岔口甩过头) */
 #define AVOID_FWD_MS      750u     /* 避障侧移前进时长 */
-#define SPIN_PWM          150      /* 原地转占空比 */
+#define SPIN_PWM          150      /* 原地转占空比(循迹/避障用) */
+
+/* ---------- 手动遥控(蓝牙) ---------- */
+#define MAN_SPEED         70       /* 手动遥控直行/后退占空比(慢速易控) */
+#define MAN_SPIN          90       /* 手动遥控原地转占空比(慢速) */
+#define MAN_HOLD_MS       400u     /* 手动遥控指令保持: 超过此ms无新指令即停车(松手即停);
+                                     须大于 App 按住循环发送的间隔(建议 App 间隔 100~200ms) */
 
 /* ---------- 循迹 ---------- */
 #define TRACK_BASE        100      /* 循迹基础巡航占空比(U/J可在线调) */
@@ -201,6 +207,9 @@ static uint32_t  lap1_ms = 0, lap2_ms = 0, rev_ms = 0;
 static float     speed_calib = 0;    /* 20cm标定速度 cm/s */
 
 static int16_t   base_speed = TRACK_BASE;
+
+/* 手动遥控: 最近一次收到运动指令的时刻(0=已停); 超时停车用, 实现"松手即停" */
+static uint32_t  man_last_cmd = 0;
 
 /* ---- 现场标定值(掉电复位为上面的宏; 运行中可用蓝牙 T/F/Y/H 在线微调) ---- */
 static int16_t   ret_base = RET_BASE;           /* 倒车基础速度(蓝牙 T/F 在线调) */
@@ -806,6 +815,7 @@ static void BT_Process(uint8_t c)
     case 'M':
         if (state == ST_LAP1_DONE) {
             LineEvt_Reset();
+            man_last_cmd = 0;                       /* 进手动圈前清遥控时间戳 */
             Goto(ST_MANUAL);
         }
         break;
@@ -818,12 +828,12 @@ static void BT_Process(uint8_t c)
         }
         break;
 
-    /* --- 手动遥控(仅手动圈生效) --- */
-    case 'W': if (state == ST_MANUAL) Motor_Set( base_speed,  base_speed); break;
-    case 'S': if (state == ST_MANUAL) Motor_Set(-base_speed, -base_speed); break;
-    case 'A': if (state == ST_MANUAL) Motor_Set(-SPIN_PWM,  SPIN_PWM);      break;
-    case 'D': if (state == ST_MANUAL) Motor_Set( SPIN_PWM, -SPIN_PWM);     break;
-    case 'X': if (state == ST_MANUAL) Motor_Stop();                        break;
+    /* --- 手动遥控(仅手动圈生效): 慢速 + 收到指令刷新时间戳(松手即停) --- */
+    case 'W': if (state == ST_MANUAL) { Motor_Set( MAN_SPEED,  MAN_SPEED); man_last_cmd = HAL_GetTick(); } break;
+    case 'S': if (state == ST_MANUAL) { Motor_Set(-MAN_SPEED, -MAN_SPEED); man_last_cmd = HAL_GetTick(); } break;
+    case 'A': if (state == ST_MANUAL) { Motor_Set(-MAN_SPIN,   MAN_SPIN);  man_last_cmd = HAL_GetTick(); } break;
+    case 'D': if (state == ST_MANUAL) { Motor_Set( MAN_SPIN,  -MAN_SPIN);  man_last_cmd = HAL_GetTick(); } break;
+    case 'X': if (state == ST_MANUAL) { Motor_Stop(); man_last_cmd = 0; }                  break;
 
 #if REC_DBG
     /* --- 录制模式控制 --- */
@@ -1359,6 +1369,11 @@ static void Main_Loop(void)
     case ST_MANUAL: {                               /* 手动遥控圈, 线终点 */
         uint32_t lap = now - t_state;
         uint8_t  evt = LineEvt_Task();
+        /* 松手即停: 超过 MAN_HOLD_MS 无新指令就停车(不记忆指令) */
+        if (man_last_cmd && now - man_last_cmd > MAN_HOLD_MS) {
+            Motor_Stop();
+            man_last_cmd = 0;
+        }
         if ((evt == 1 || evt == 2) && lap > MIN_LAP_MS) {
             Motor_Stop();
             lap2_ms = lap;
