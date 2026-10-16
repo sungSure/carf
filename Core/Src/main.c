@@ -79,6 +79,10 @@
                                         与 TRACK_DBG 互斥; 采完改0恢复验收流程 */
 #define EVT_LOG           1        /* 1=线事件(分叉/终点)出现即经蓝牙发 "#EVT ..." 打点,
                                         便于手机串口核对触发时刻; 不需要时改0 */
+#define SPEED_TEST        1        /* 1=测速模式: 话筒触发后按循迹速度(base_speed)直行,
+                                        到终点横线自动停车计时, OLED显示+蓝牙打点用时;
+                                        用于"测时间+已知距离"反推速度; 测完改0恢复验收流程 */
+#define TEST_MIN_MS       500u     /* 测速模式: 最早接受终点的时间ms(防起步瞬间压到起点横线误判) */
 
 /* ---------- 数据录制(临时诊断) ---------- */
 #define REC_MAX           2000u    /* 最大记录条数(仅记变化沿), 每条3字节 ≈6KB RAM */
@@ -180,6 +184,7 @@
 typedef enum {
     ST_STANDBY,       /* 待命等启动信号 */
     ST_RUN20,         /* 直行20cm */
+    ST_SPEED_TEST,    /* 测速: 话筒触发后按循迹速度直行到终点计时 */
     ST_WAIT5,         /* 停车计时5s */
     ST_LAP1,          /* 自动圈去程: 循迹+雷达+避障+Y路口选择 */
     ST_RETURN,        /* 终点掉头, 沿原路返回起点并停车 */
@@ -218,6 +223,10 @@ static int16_t   base_speed = TRACK_BASE;
 static uint32_t  man_last_cmd = 0;
 /* 手动圈终点检测使能: 0=不检测(直角弯会被误判成终点), 蓝牙发'G'后置1恢复检测 */
 static uint8_t   man_end_armed = 0;
+
+/* 测速模式: 直行到终点的用时ms + 是否已停车 */
+static uint32_t  test_ms = 0;
+static uint8_t   test_done = 0;
 
 /* ---- 现场标定值(掉电复位为上面的宏; 运行中可用蓝牙 T/F/Y/H 在线微调) ---- */
 static int16_t   ret_base = RET_BASE;           /* 倒车基础速度(蓝牙 T/F 在线调) */
@@ -922,6 +931,23 @@ static void UI_Task(void)
         OLED_PrintASCIIString(28, 8, "RUN 20 CM", &afont16x8, OLED_COLOR_NORMAL);
         break;
 
+    case ST_SPEED_TEST: {
+        uint32_t el = now - t_state;
+        OLED_PrintASCIIString(16, 0, "SPEED TEST", &afont16x8, OLED_COLOR_NORMAL);
+        if (!test_done) {
+            sprintf(buf, "RUN %lu.%01lus", (unsigned long)(el / 1000),
+                    (unsigned long)((el / 100) % 10));
+            OLED_PrintASCIIString(10, 28, buf, &afont12x6, OLED_COLOR_NORMAL);
+            OLED_PrintASCIIString(10, 44, "TO END LINE", &afont12x6, OLED_COLOR_NORMAL);
+        } else {
+            sprintf(buf, "T %lu.%02lus", (unsigned long)(test_ms / 1000),
+                    (unsigned long)((test_ms / 10) % 100));
+            OLED_PrintASCIIString(10, 24, buf, &afont12x6, OLED_COLOR_NORMAL);
+            OLED_PrintASCIIString(4, 44, "TELL DISTANCE", &afont12x6, OLED_COLOR_NORMAL);
+        }
+        break;
+    }
+
     case ST_WAIT5: {
         uint32_t left = 5 - (now - t_state) / 1000;
         OLED_PrintASCIIString(28, 8, "WAIT 5S", &afont16x8, OLED_COLOR_NORMAL);
@@ -1157,6 +1183,11 @@ static void Main_Loop(void)
                     Rec_Reset();
                     last_err = 0; t_lost = 0; lost_err = 0;
                     Goto(ST_RECORD);            /* 录制模式: 直接进纯循迹录制 */
+#elif SPEED_TEST
+                    LineEvt_Reset();            /* 清线事件, 从当前帧重新跟踪终点 */
+                    test_ms  = 0; test_done = 0;
+                    last_err = 0; t_lost = 0; lost_err = 0;
+                    Goto(ST_SPEED_TEST);        /* 测速: 直行到终点计时 */
 #else
                     Motor_Set(RUN20_PWM, RUN20_PWM);
                     Goto(ST_RUN20);
@@ -1197,6 +1228,23 @@ static void Main_Loop(void)
             Goto(ST_WAIT5);
         }
         break;
+
+    case ST_SPEED_TEST: {                           /* 测速: 话筒触发后按循迹速度直行到终点 */
+        uint8_t evt = LineEvt_Task();
+        if (!test_done) Motor_Set(base_speed, base_speed);   /* 持续直行(幂等) */
+        if (evt == 1 && !test_done && now - t_state > TEST_MIN_MS) {
+            Motor_Stop();
+            test_ms   = now - t_state;              /* 直行总时长ms */
+            test_done = 1;
+            Buzzer_Beep(P_DONE);
+#if (BT_ENABLE || REC_DBG)
+            {   char b[40];
+                sprintf(b, "#SPDTEST t=%lums\r\n", (unsigned long)test_ms);
+                Bt_Log(b); }
+#endif
+        }
+        break;
+    }
 
     case ST_WAIT5:                                  /* 停车计时5s后蜂鸣起步 */
         if (now - t_state >= 5000) {
