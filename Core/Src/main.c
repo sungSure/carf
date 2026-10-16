@@ -91,7 +91,7 @@
 
 /* ---------- 基本动作标定(无编码器, 全部时间法, 现场调) ---------- */
 #define RUN20_PWM         130      /* 直行20cm的占空比 */
-#define RUN20_MS          600u     /* 直行20cm的时长: 实测 1200ms 跑了40cm(是目标2倍), 故减半=600ms≈20cm */
+#define RUN20_MS          500u     /* 直行20cm的时长: 实测 1200ms 跑了40cm(是目标2倍), 故减半=600ms≈20cm */
 #define TURN90_MS         520u     /* 原地转约90°的时长 */
 /* Y路口分支选择 = 传感器闭环的原地小半径旋转, 分四步:
    [1] 原地旋转(外侧正转/内侧倒转 → 半径最小、弧线最短)
@@ -111,8 +111,9 @@
 #define Y_ESCAPE_MIN_MS   40u      /* 转完至少直行这么久驶离岔口 */
 #define Y_ESCAPE_MS       300u     /* 直行的上限(看到线就提前交回) */
 #define Y_SETTLE_WIN_MS   600u     /* 岔路后这么久内: 循迹丢线(全白)→直行, 不保持转角(防岔口甩过头) */
-#define AVOID_FWD_MS      1300u    /* 避障侧移前进时长: base_speed(100PWM)≈25.6cm/s(由RUN20实测130PWM=33.3cm/s线性推),
-                                      1300ms≈33cm侧移, 足以错开 18cm车宽 + 障碍物 并留余量(原750ms≈19cm < 车宽, 绕不过) */
+#define AVOID_FWD_MS      700u     /* 避障侧移前进时长: base_speed(100PWM)≈25.6cm/s → 700ms≈18cm侧移。
+                                      障碍物只是500ml矿泉水(直径约6.5cm), 错开量需 > 车宽半9 + 瓶半3.25 ≈12.3cm,
+                                      18cm足够且绕完离黑线近(易斜插回线); 上轮33cm是针对大障碍, 对小瓶绕太远反而找不回线 */
 #define SPIN_PWM          150      /* 原地转占空比(循迹/避障用) */
 
 /* ---------- 手动遥控(蓝牙) ---------- */
@@ -266,6 +267,7 @@ static uint32_t  rec_hb_t = 0;       /* 上次心跳时刻 */
 static AvoidStep av = AV_IDLE;
 static uint32_t   av_t;
 static float      av_dl, av_dr;
+static int8_t     av_side;            /* 绕行侧: +1左绕 -1右绕(反侧即黑线所在侧, 收尾斜插回线用) */
 static YStep      ys = YS_IDLE;
 static uint32_t   ys_t;
 static uint32_t   y_aim_t;           /* 本轮岔路"瞄准到分支线"的时刻, 0=还没瞄准 */
@@ -482,13 +484,13 @@ static void Radar_Task(void)
     }
 }
 
-/* 正前方±30°(60~120°)最近距离 */
+/* 正前方(90°)距离: 只规避黑线正前方的障碍物。
+   右侧/左侧线外的障碍(如矿泉水瓶放线旁)角度偏离90°>15°, 不触发;
+   500ml瓶(直径约6.5cm)在黑线上时必落在90°探头波束(半角约15°)内, 不漏测。
+   注: radar_seq 每2点插一次90°, 90°数据约每400ms刷新, 已是最新鲜的正前方值。 */
 static float Front_Min(void)
 {
-    float m = 999;
-    for (uint8_t i = 4; i <= 8; i++)
-        if (radar_dist[i] > 0 && radar_dist[i] < m) m = radar_dist[i];
-    return m;
+    return radar_dist[6] > 0 ? radar_dist[6] : 999.0f;
 }
 
 /* ================= 红外采样与线事件 ================= */
@@ -671,9 +673,9 @@ static void Avoid_Task(void)
         if (US_Poll(&cm)) { av_dr = (cm > 1 && cm < 300) ? cm : 300; }
         else if (now - av_t > US_TIMEOUT_MS) { av_dr = 300; }
         else break;
-        /* 往空间大的一侧绕: 左侧空→左转 */
-        if (av_dl >= av_dr) Motor_Set(-SPIN_PWM,  SPIN_PWM);
-        else                Motor_Set( SPIN_PWM, -SPIN_PWM);
+        /* 往空间大的一侧绕: 左侧空→左转; 记录绕行侧(反侧=黑线侧, 供收尾斜插回线) */
+        if (av_dl >= av_dr) { Motor_Set(-SPIN_PWM,  SPIN_PWM); av_side = +1; }  /* 左绕 */
+        else                { Motor_Set( SPIN_PWM, -SPIN_PWM); av_side = -1; }  /* 右绕 */
         av = AV_TURN_AWAY; av_t = now;
         break;
 
@@ -699,7 +701,7 @@ static void Avoid_Task(void)
         }
         break;
 
-    case AV_REACQ:                                  /* 低速找回黑线 */
+    case AV_REACQ:                                  /* 斜插回黑线(绕行反侧=黑线侧) */
         if (g_ir != 0 && g_ir != 0x0F) {           /* 找到线 */
             av = AV_IDLE;
             Radar_Enable();                        /* 雷达继续扫 */
@@ -708,6 +710,10 @@ static void Avoid_Task(void)
             av = AV_IDLE;
             Radar_Enable();
             LineEvt_Reset();
+        } else {                                    /* 前进+朝黑线侧偏转, 斜着切回原线 */
+            int16_t spd = base_speed * 7 / 10;
+            if (av_side > 0) Motor_Set(spd, spd - 50);   /* 左绕→黑线在右→右偏斜插 */
+            else             Motor_Set(spd - 50, spd);   /* 右绕→黑线在左→左偏斜插 */
         }
         break;
     }
