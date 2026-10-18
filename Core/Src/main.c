@@ -95,7 +95,7 @@
 
 /* ---------- 基本动作标定(无编码器, 全部时间法, 现场调) ---------- */
 #define RUN20_PWM         130      /* 直行20cm的占空比 */
-#define RUN20_MS          600u     /* 直行20cm的时长: 实测 1200ms 跑了40cm(是目标2倍), 故减半=600ms≈20cm */
+#define RUN20_MS          500u     /* 直行20cm的时长:需要实测，不可简单计算线性关系*/
 #define TURN90_MS         520u     /* 原地转约90°的时长 */
 /* Y路口分支选择 = 传感器闭环的原地小半径旋转, 分四步:
    [1] 原地旋转(外侧正转/内侧倒转 → 半径最小、弧线最短)
@@ -106,6 +106,7 @@
    几何依据(实测 ir_log): 分叉瞬间 1001 = 左支线在 L2、右支线在 R2。
    原地右转时视场整体左移 → 右支线 R2→R1→中→L1 扫过来; 左转相反。
    故 选右 → 盯 R1(0x2); 选左 → 盯 L1(0x4)。 */
+#define Y_HOLD_WAIT       1        /* 1=岔路口停车等蓝牙L/R选向(赛场随机应变); 0=按预设方向直接转 */
 #define Y_OUT             150      /* 旋转外侧轮速 */
 #define Y_IN              (-50)    /* 旋转内侧轮速(负=倒转 → 掉头式小半径) */
 #define Y_TURN_MIN_MS     150u     /* 最短旋转时间: 滤掉分叉瞬间的抖动 */
@@ -212,7 +213,7 @@ typedef enum {
 } AvoidStep;
 
 /* Y路口子流程 */
-typedef enum { YS_IDLE, YS_TURN, YS_ESCAPE } YStep;
+typedef enum { YS_IDLE, YS_HOLD, YS_TURN, YS_ESCAPE } YStep;
 
 static CarState  state = ST_STANDBY;
 static uint32_t  t_state;            /* 进入当前状态的时刻 */
@@ -737,6 +738,9 @@ static void Y_Task(void)
     switch (ys) {
     case YS_IDLE:
         return;
+    case YS_HOLD:                                   /* 岔路口停车, 等蓝牙 L/R 选向(赛场随机应变) */
+        Motor_Stop();
+        break;                                      /* 收到 L/R 后由 BT_Process 切到 YS_TURN */
     case YS_TURN: {                                 /* 原地小半径旋转抢分支(传感器闭环) */
         uint32_t dt  = now - ys_t;
         uint16_t cap = y_choice_left ? y_turn_l_ms : y_turn_r_ms;
@@ -793,6 +797,14 @@ static void Y_Task(void)
     }
 }
 
+/* 岔路口等待(YS_HOLD)中收到蓝牙 L/R 选向 → 切入旋转 */
+static void Y_Choose_Go(void)
+{
+    if (ys == YS_HOLD) {
+        ys = YS_TURN; ys_t = HAL_GetTick(); y_aim_t = 0;
+    }
+}
+
 /* ================= 现场标定参数回传 ================= */
 static void Cal_Log(void)
 {
@@ -818,8 +830,8 @@ static void BT_Process(uint8_t c)
         base_speed -= 10;
         if (base_speed < 60) base_speed = 60;
         break;
-    case 'L': y_choice_left = 1; break;             /* Y路口选左 */
-    case 'R': y_choice_left = 0; break;             /* Y路口选右 */
+    case 'L': y_choice_left = 1; Y_Choose_Go(); break;   /* Y路口选左(等待中则立即转) */
+    case 'R': y_choice_left = 0; Y_Choose_Go(); break;   /* Y路口选右(等待中则立即转) */
 
     /* --- 现场标定(掉电恢复为宏定义值; 每按一次回一条 #CAL) --- */
     case 'T': ret_base += 10; if (ret_base > PWM_MAX) ret_base = PWM_MAX; Cal_Log(); break;
@@ -995,6 +1007,7 @@ static void UI_Task(void)
                                     y > 0 ? (uint8_t)(y - 1) : 0, 3, 3, OLED_COLOR_NORMAL);
         }
         if (lost_err) OLED_PrintASCIIString(34, 12, "LOST!", &afont8x6, OLED_COLOR_NORMAL);
+        if (ys == YS_HOLD) OLED_PrintASCIIString(16, 12, "Y: FORK L/R?", &afont8x6, OLED_COLOR_NORMAL);
         break;
     }
 
@@ -1313,8 +1326,16 @@ static void Main_Loop(void)
         /* Y路口(分叉): 本圈未处理过 */
         if (evt == 2 && lap > 1500 && !y_fired) {
             y_fired = 1;
+#if Y_HOLD_WAIT
+            Motor_Stop();
+            ys = YS_HOLD; ys_t = now; y_aim_t = 0;   /* 停车等蓝牙 L/R 选向(赛场随机应变) */
+#else
             ys = YS_TURN; ys_t = now; y_aim_t = 0;   /* 岔路旋转交给 Y_Task(传感器闭环) */
+#endif
             Y_Task();                                /* 当拍就生效, 不留空转 */
+#if Y_HOLD_WAIT && (BT_ENABLE || REC_DBG)
+            Bt_Log("#Y HOLD: send L/R\r\n");         /* 提示操作员现场发选向指令 */
+#endif
             break;
         }
 
