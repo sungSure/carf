@@ -115,9 +115,9 @@
 #define Y_ESCAPE_MIN_MS   40u      /* 转完至少直行这么久驶离岔口 */
 #define Y_ESCAPE_MS       300u     /* 直行的上限(看到线就提前交回) */
 #define Y_SETTLE_WIN_MS   600u     /* 岔路后这么久内: 循迹丢线(全白)→直行, 不保持转角(防岔口甩过头) */
-#define AVOID_FWD_MS      700u     /* 避障侧移前进时长: base_speed(100PWM)≈25.6cm/s → 700ms≈18cm侧移。
+#define AVOID_FWD_MS      700u     /* 避障侧移前进时长: base_speed(100PWM)≈29.2cm/s(实测) → 700ms≈20.4cm侧移。
                                       障碍物只是500ml矿泉水(直径约6.5cm), 错开量需 > 车宽半9 + 瓶半3.25 ≈12.3cm,
-                                      18cm足够且绕完离黑线近(易斜插回线); 上轮33cm是针对大障碍, 对小瓶绕太远反而找不回线 */
+                                      20cm足够且绕完离黑线近(易斜插回线); 上轮33cm是针对大障碍, 对小瓶绕太远反而找不回线 */
 #define SPIN_PWM          150      /* 原地转占空比(循迹/避障用) */
 
 /* ---------- 手动遥控(蓝牙) ---------- */
@@ -129,6 +129,8 @@
 
 /* ---------- 循迹 ---------- */
 #define TRACK_BASE        100      /* 循迹基础巡航占空比(U/J可在线调) */
+#define SPEED_CM_PER_S    29.2f    /* 实测循迹速度: base_speed=100PWM 直行 63cm/2.16s = 29.17cm/s
+                                      (2026-10-18 测速模块实测; 之前注释里估 25.6 偏慢 14%) */
 #define TRACK_K           28       /* 转向增益: 差速 = K*err, 摆动大→减, 弯道跟不上→加 */
 #define TRACK_DIFF_MAX    70       /* 差速限幅: 单侧加减的上限, 削峰防甩尾 */
 #define GAP_HOLD_MS       120u     /* 线在传感器间隙(全白)时保持原曲率的时间, 超过才算真丢线 */
@@ -1157,6 +1159,8 @@ static void Main_Loop(void)
     /* ---- 公共任务 ---- */
     Buzzer_Task();
     if (bt_flag) { uint8_t c = bt_data; bt_flag = 0; BT_Process(c); }
+    /* 当前循迹速度(实测基准 × base_speed/TRACK_BASE, 随 U/J 调参实时更新; 供OLED显示) */
+    speed_calib = SPEED_CM_PER_S * (float)base_speed / (float)TRACK_BASE;
     g_ir = IR_Read();
 #if REC_DBG
     if (state == ST_RECORD) Rec_Sample(now);      /* 录制: 每次迭代采样(仅记变化沿) */
@@ -1224,7 +1228,6 @@ static void Main_Loop(void)
     case ST_RUN20:                                  /* 直行20cm(时间法标定) */
         if (now - t_state >= RUN20_MS) {
             Motor_Stop();
-            speed_calib = 20000.0f / (float)RUN20_MS;   /* 20cm/时长 → cm/s */
             Goto(ST_WAIT5);
         }
         break;
