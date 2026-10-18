@@ -6,10 +6,10 @@
   ******************************************************************************
   * @attention
   *
-  * 流程: 待命 → 启动(PA15声音) → 直行20cm → 停车计时5s → 蜂鸣
-  *       → 去程循迹(雷达扫描+点云图+Y路口分叉识别+避障) → 到终点横线停车
-  *       → 倒车沿原路返回起点横线停车(记去程/返程/总时)
-  *       → 第2圈手动遥控(蓝牙) → 数据显示 → (拓展)逆向循迹返程
+ * 流程: 待命 → 启动(PA15声音) → 直行20cm → 停车计时5s → 蜂鸣
+ *       → 去程循迹(雷达扫描+点云图+Y路口分叉识别+避障) → 到终点横线停车
+ *       → 停车等人工放回起点(记去程用时, 暂不自动倒车)
+ *       → 第2圈手动遥控(蓝牙) → 数据显示 → (拓展)逆向循迹返程
   *
   * 架构: 主循环无阻塞, 全部基于 HAL_GetTick() 时间片调度
   *       电机统一接口 Motor_Set(左,右) ∈ [-199,199]
@@ -77,9 +77,9 @@
 #define REC_DBG           0        /* 1=录制模式(临时诊断): 声控启动后纯循迹, 记录传感器
                                         变化沿, 到终点横线或录满后经蓝牙(USART3)回传文本;
                                         与 TRACK_DBG 互斥; 采完改0恢复验收流程 */
-#define EVT_LOG           1        /* 1=线事件(分叉/终点)出现即经蓝牙发 "#EVT ..." 打点,
+#define EVT_LOG           0        /* 1=线事件(分叉/终点)出现即经蓝牙发 "#EVT ..." 打点,
                                         便于手机串口核对触发时刻; 不需要时改0 */
-#define SPEED_TEST        1        /* 1=测速模式: 话筒触发后按循迹速度(base_speed)直行,
+#define SPEED_TEST        0        /* 1=测速模式: 话筒触发后按循迹速度(base_speed)直行,
                                         到终点横线自动停车计时, OLED显示+蓝牙打点用时;
                                         用于"测时间+已知距离"反推速度; 测完改0恢复验收流程 */
 #define TEST_MIN_MS       500u     /* 测速模式: 最早接受终点的时间ms(防起步瞬间压到起点横线误判) */
@@ -95,7 +95,7 @@
 
 /* ---------- 基本动作标定(无编码器, 全部时间法, 现场调) ---------- */
 #define RUN20_PWM         130      /* 直行20cm的占空比 */
-#define RUN20_MS          500u     /* 直行20cm的时长: 实测 1200ms 跑了40cm(是目标2倍), 故减半=600ms≈20cm */
+#define RUN20_MS          600u     /* 直行20cm的时长: 实测 1200ms 跑了40cm(是目标2倍), 故减半=600ms≈20cm */
 #define TURN90_MS         520u     /* 原地转约90°的时长 */
 /* Y路口分支选择 = 传感器闭环的原地小半径旋转, 分四步:
    [1] 原地旋转(外侧正转/内侧倒转 → 半径最小、弧线最短)
@@ -189,7 +189,7 @@ typedef enum {
     ST_SPEED_TEST,    /* 测速: 话筒触发后按循迹速度直行到终点计时 */
     ST_WAIT5,         /* 停车计时5s */
     ST_LAP1,          /* 自动圈去程: 循迹+雷达+避障+Y路口选择 */
-    ST_RETURN,        /* 终点掉头, 沿原路返回起点并停车 */
+    ST_RETURN,        /* (保留, 当前流程不用) 倒车沿原路返回起点并停车 */
 #if REC_DBG
     ST_RECORD,        /* 临时: 纯循迹并录制传感器数据(诊断用) */
 #endif
@@ -217,7 +217,7 @@ typedef enum { YS_IDLE, YS_TURN, YS_ESCAPE } YStep;
 static CarState  state = ST_STANDBY;
 static uint32_t  t_state;            /* 进入当前状态的时刻 */
 static uint32_t  lap1_ms = 0, lap2_ms = 0, rev_ms = 0;
-static float     speed_calib = 0;    /* 20cm标定速度 cm/s */
+static float     speed_calib = 0;    /* 当前循迹速度 cm/s(主循环每拍按实测基准×base_speed/TRACK_BASE更新) */
 
 static int16_t   base_speed = TRACK_BASE;
 
@@ -483,7 +483,7 @@ static void Radar_Task(void)
             radar_t = now;
         }
     } else {                                     /* 测距期 */
-        float cm;
+        float cm = 999.0f;                       /* 默认无目标: 防超时分支用未初始化垃圾值误判成障碍 */
         uint8_t ang = radar_seq[radar_pos];
         if (US_Poll(&cm) || now - radar_t > US_TIMEOUT_MS) {
             radar_dist[ang / 15] = (cm > 1 && cm < RADAR_MAX_CM) ? cm : 0;
